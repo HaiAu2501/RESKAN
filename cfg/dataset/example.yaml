@@ -3,6 +3,4 @@ root: example
 task: denoising
 lq_dirname: lq
 gt_dirname: gt
-validation: 0.1
-extensions: [png, jpg, jpeg]
 patch_size: 128
