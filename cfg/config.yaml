@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - dataset: reside
+  - dataset: example
   - model: reskan
 
 seed: 42

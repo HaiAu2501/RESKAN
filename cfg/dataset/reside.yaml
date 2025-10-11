@@ -1,7 +1,7 @@
 name: RESIDE-6K
-task: dehazing
 root: RESIDE-6K
+task: dehazing
 lq_dirname: hazy
-hq_dirname: GT
-split_ratio: 0.9
+gt_dirname: GT
+validation: 0.1
 extensions: [png, jpg, jpeg]

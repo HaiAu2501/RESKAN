@@ -6,3 +6,4 @@ NOTE.md
 *.png
 bin/
 outputs/
+.private/
