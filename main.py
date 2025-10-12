@@ -16,6 +16,7 @@ def setup(cfg: DictConfig) -> Trainer:
         callbacks=[ckpt_callback],
         accelerator=cfg.accelerator,
         devices=cfg.devices,
+        precision="16-mixed",
         gradient_clip_val=1.0,
     )
     return trainer

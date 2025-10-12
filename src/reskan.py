@@ -1,4 +1,4 @@
-# reskan_lightning.py
+# reskan_lightning_memopt.py
 import math
 from typing import List
 
@@ -31,7 +31,6 @@ class CharbonnierLoss(nn.Module):
 
 
 def tv_l1(x):
-    """Total variation L1 (nhẹ, optional)."""
     loss = (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
     return loss
 
@@ -48,18 +47,13 @@ class HaarDWT2D(nn.Module):
         Fch = channels
         h = torch.tensor([1.0 / math.sqrt(2), 1.0 / math.sqrt(2)])
         g = torch.tensor([1.0 / math.sqrt(2), -1.0 / math.sqrt(2)])
-        ll = torch.einsum('i,j->ij', h, h)  # 2x2
+        ll = torch.einsum('i,j->ij', h, h)
         lh = torch.einsum('i,j->ij', h, g)
         hl = torch.einsum('i,j->ij', g, h)
         hh = torch.einsum('i,j->ij', g, g)
-        # Make 4 filters per channel
-        weight = torch.stack([ll, lh, hl, hh], dim=0)  # (4, 2, 2)
-        weight = weight.unsqueeze(1)  # (4, 1, 2, 2)
-        weight = weight.repeat(Fch, 1, 1, 1)  # (4F, 1, 2, 2)
+        weight = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1).repeat(Fch, 1, 1, 1)  # (4F,1,2,2)
         self.register_buffer("weight", weight)
-        self.groups = Fch
-        self.conv = nn.Conv2d(in_channels=Fch, out_channels=4 * Fch, kernel_size=2, stride=2,
-                              padding=0, groups=Fch, bias=False)
+        self.conv = nn.Conv2d(Fch, 4 * Fch, kernel_size=2, stride=2, padding=0, groups=Fch, bias=False)
         with torch.no_grad():
             self.conv.weight.copy_(self.weight)
         for p in self.conv.parameters():
@@ -68,7 +62,6 @@ class HaarDWT2D(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         if H % 2 != 0 or W % 2 != 0:
-            # pad reflect nếu kích thước lẻ
             x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
         return self.conv(x)
 
@@ -86,15 +79,9 @@ class HaarIDWT2D(nn.Module):
         lh = torch.einsum('i,j->ij', h, g)
         hl = torch.einsum('i,j->ij', g, h)
         hh = torch.einsum('i,j->ij', g, g)
-        # transpose-conv weight shape: (in_channels, out_channels_per_group, kH, kW)
-        weight = torch.stack([ll, lh, hl, hh], dim=0)  # (4, 2, 2)
-        weight = weight.unsqueeze(1)  # (4, 1, 2, 2)
-        weight = weight.repeat(Fch, 1, 1, 1)  # (4F, 1, 2, 2)
+        weight = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1).repeat(Fch, 1, 1, 1)  # (4F,1,2,2)
         self.register_buffer("weight", weight)
-        self.groups = Fch
-        # in_channels = 4F, out_channels = F, groups=F => weight (4F, 1, 2, 2)
-        self.deconv = nn.ConvTranspose2d(in_channels=4 * Fch, out_channels=Fch, kernel_size=2, stride=2,
-                                         padding=0, groups=Fch, bias=False)
+        self.deconv = nn.ConvTranspose2d(4 * Fch, Fch, kernel_size=2, stride=2, padding=0, groups=Fch, bias=False)
         with torch.no_grad():
             self.deconv.weight.copy_(self.weight)
         for p in self.deconv.parameters():
@@ -104,101 +91,106 @@ class HaarIDWT2D(nn.Module):
         return self.deconv(x)
 
 
-# --------------------------------
-#  KAN 1D spline (per-feature)
-# --------------------------------
-def _open_uniform_knots(K: int, degree: int, low: float = -1.0, high: float = 1.0, device=None):
-    """
-    Open-uniform knot vector: [low,...(p+1), interior..., high...(p+1)], total length = K+degree+1.
-    Requires K >= degree+1; if not, we still build clamped extremes.
-    """
+# ---------------------------------------------------------
+#  Memory-efficient local B-spline evaluation (p+1 only)
+# ---------------------------------------------------------
+def _open_uniform_knots(K: int, degree: int, low: float = -1.0, high: float = 1.0, device=None, dtype=None):
     p = degree
     assert K >= p + 1, f"K must be >= degree+1; got K={K}, degree={p}"
     n_interior = K - p - 1
     if n_interior > 0:
-        interior = torch.linspace(low, high, n_interior + 2, device=device)[1:-1]
+        interior = torch.linspace(low, high, n_interior + 2, device=device, dtype=dtype)[1:-1]
         knots = torch.cat([
-            torch.full((p + 1,), low, device=device),
+            torch.full((p + 1,), low, device=device, dtype=dtype),
             interior,
-            torch.full((p + 1,), high, device=device)
+            torch.full((p + 1,), high, device=device, dtype=dtype)
         ], dim=0)
     else:
-        # No interior knots, just clamped ends
         knots = torch.cat([
-            torch.full((p + 1,), low, device=device),
-            torch.full((p + 1,), high, device=device)
+            torch.full((p + 1,), low, device=device, dtype=dtype),
+            torch.full((p + 1,), high, device=device, dtype=dtype)
         ], dim=0)
     return knots  # shape: (K + p + 1,)
 
 
-def _bspline_basis(x: torch.Tensor, knots: torch.Tensor, degree: int) -> torch.Tensor:
+def _find_span_bucketize(x: torch.Tensor, knots: torch.Tensor, K: int, p: int):
     """
-    Cox–de Boor. x: (...), knots: (K+p+1,), degree=p.
-    Returns basis B: (..., K)
+    Return span index i in [p, K-1] s.t. knots[i] <= x < knots[i+1].
+    Vectorized via torch.bucketize.
     """
-    p = degree
-    K = knots.numel() - p - 1  # number of basis
-    *spatial, = x.shape
-    # N for p=0 has length (K+p)
-    L = K + p
-    # Expand dims for broadcasting with i-index
-    x_exp = x.unsqueeze(-1)  # (..., 1)
-    # Indicator for N_{i,0}
-    t0 = knots[:-1]  # (K+p,)
-    t1 = knots[1:]   # (K+p,)
-    # shape-broadcast to (..., L)
-    N = ((x_exp >= t0) & (x_exp < t1)).to(x.dtype)
-    # Special case include right boundary at the last knot:
-    N = torch.where((x_exp == knots[-1]), torch.cat([torch.zeros_like(N[..., :L-1]), torch.ones_like(N[..., :1])], dim=-1), N)
-
-    # recursion
-    for r in range(1, p + 1):
-        Lr = K + p - (r - 1)      # current length
-        # after update, new length will be Lr-1
-        left_den = (knots[r: r + Lr - 1] - knots[:Lr - 1])  # (Lr-1,)
-        right_den = (knots[r + 1: r + 1 + Lr - 1] - knots[1: Lr])  # (Lr-1,)
-
-        left_num = x_exp - knots[:Lr - 1]           # (..., Lr-1)
-        right_num = knots[r + 1: r + 1 + Lr - 1] - x_exp  # (..., Lr-1)
-
-        left = torch.zeros_like(N[..., :Lr - 1])
-        right = torch.zeros_like(N[..., :Lr - 1])
-
-        nonzero = left_den != 0
-        if nonzero.any():
-            left = torch.where(
-                nonzero,
-                (left_num / left_den) * N[..., :Lr - 1],
-                left
-            )
-
-        nonzero2 = right_den != 0
-        if nonzero2.any():
-            right = torch.where(
-                nonzero2,
-                (right_num / right_den) * N[..., 1:Lr],
-                right
-            )
-        N = left + right  # (..., Lr-1)
-
-    # N now has shape (..., K)
-    return N
+    # edges for bucketize correspond to knots[p:K]
+    edges = knots[p:K]  # length K-p
+    i = torch.bucketize(x, edges, right=False) + p - 1
+    # Handle right boundary x == knots[-1]
+    i = torch.where(x >= knots[K], torch.full_like(i, K - 1), i)
+    # Clamp just in case
+    return i.clamp(min=p, max=K - 1)
 
 
+def _bspline_local_values(x: torch.Tensor, knots: torch.Tensor, K: int, p: int):
+    """
+    Compute local B-spline basis values N_{i-p..i,p}(x) of length (p+1) and the start index (i-p),
+    for every element of x. All vectorized over x; loops only over degree p (small).
+    Returns:
+      N: (*, p+1)
+      start: (*)  (int64), such that these (p+1) values correspond to basis indices start..start+p
+    """
+    device = x.device
+    dtype = x.dtype
+    i = _find_span_bucketize(x, knots, K, p)                  # (*)
+    start = i - p                                             # (*)
+
+    # Build left[j] = x - knots[i+1-j], right[j] = knots[i+j] - x for j=1..p
+    # Prepare index tensors for gather
+    shape = x.shape
+    # indices for left/right per j
+    js = torch.arange(1, p + 1, device=device)                # (p,)
+    idx_left = (i.unsqueeze(-1) + 1 - js)                     # (*, p)
+    idx_right = (i.unsqueeze(-1) + js)                        # (*, p)
+
+    # gather knots
+    t_left = knots.index_select(0, idx_left.reshape(-1)).reshape(*shape, p)   # (*, p)
+    t_right = knots.index_select(0, idx_right.reshape(-1)).reshape(*shape, p) # (*, p)
+
+    x_exp = x.unsqueeze(-1)                                   # (*, 1)
+    left = x_exp - t_left                                     # (*, p)
+    right = t_right - x_exp                                   # (*, p)
+
+    # Cox–de Boor local recursion
+    N = x.new_zeros(*shape, p + 1)                            # (*, p+1)
+    N[..., 0] = 1.0
+    for j in range(1, p + 1):
+        saved = x.new_zeros(*shape)
+        for r in range(j):
+            denom = right[..., r] + left[..., j - r - 1]      # (*)
+            denom = torch.where(denom == 0, torch.ones_like(denom), denom)  # avoid div by zero
+            temp = N[..., r] / denom
+            N[..., r] = saved + right[..., r] * temp
+            saved = left[..., j - r - 1] * temp
+        N[..., j] = saved
+    return N, start
+
+
+# --------------------------------
+#  KAN 1D spline (per-feature)
+#  ==> Memory-efficient version
+# --------------------------------
 class KANSpline1D(nn.Module):
     """
-    KAN 1D per-feature: phi_c(x) = id_gain_c * x + bias_c + sum_k alpha_{c,k} * B_{k,p}(a_c * x + b_c)
-    - Shared over spatial positions; separate per-channel parameters.
-    - Stable init: identity (id_gain=1, alpha=0, a=1, b=0).
+    KAN 1D per-feature (memory-efficient):
+    phi_c(x) = id_gain_c * x + bias_c + sum_{j=0..p} alpha_{c, start+j} * N_j(x)
+    - Only (p+1) local basis values per pixel (vs. K previously).
+    - Shared knots across channels; per-channel scale/shift 'a','b' map inputs to [-1,1].
     """
-    def __init__(self, channels: int, K: int = 16, degree: int = 3):
+    def __init__(self, channels: int, K: int = 16, degree: int = 3, clamp_val: float = 1.5):
         super().__init__()
         assert K >= degree + 1, "K must be >= degree+1 for open-uniform spline."
         self.C = channels
         self.K = K
-        self.degree = degree
+        self.p = degree
+        self.clamp_val = clamp_val
 
-        # per-channel affine to map input to [-1,1] domain
+        # per-channel affine to map input to [-1,1]
         self.a = nn.Parameter(torch.ones(channels))   # scale
         self.b = nn.Parameter(torch.zeros(channels))  # shift
 
@@ -209,13 +201,11 @@ class KANSpline1D(nn.Module):
         self.id_gain = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
 
-        # knot vector (fixed, on device later)
-        self.register_buffer("knots_base", None, persistent=False)
+        self.register_buffer("knots", None, persistent=False)
 
-    def _get_knots(self, device):
-        if (self.knots_base is None) or (self.knots_base.device != device):
-            self.knots_base = _open_uniform_knots(self.K, self.degree, low=-1.0, high=1.0, device=device)
-        return self.knots_base
+    def _ensure_knots(self, device, dtype):
+        if (self.knots is None) or (self.knots.device != device) or (self.knots.dtype != dtype):
+            self.knots = _open_uniform_knots(self.K, self.p, low=-1.0, high=1.0, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -223,32 +213,35 @@ class KANSpline1D(nn.Module):
         """
         B, C, H, W = x.shape
         assert C == self.C
-        device = x.device
-        knots = self._get_knots(device)
+        self._ensure_knots(x.device, x.dtype)
 
-        # per-channel affine: x' = a_c * x + b_c
+        # per-channel affine: x' = a_c * x + b_c, then clamp (ổn định)
         x_aff = x * self.a.view(1, C, 1, 1) + self.b.view(1, C, 1, 1)
-        # clamp (optional, ổn định đầu kỳ):
-        x_aff = torch.clamp(x_aff, -1.5, 1.5)
+        if self.clamp_val is not None:
+            x_aff = torch.clamp(x_aff, -self.clamp_val, self.clamp_val)
 
-        # B-spline basis at every pixel, per channel
-        # basis: (B, C, H, W, K)
-        basis = _bspline_basis(x_aff, knots, self.degree)  # (B, C, H, W, K)
+        # --- Local B-spline values (only p+1 per pixel) ---
+        # shape of N: (B, C, H, W, p+1); start: (B, C, H, W)
+        N, start = _bspline_local_values(x_aff, self.knots, self.K, self.p)
 
-        # weight alpha per channel: (1, C, 1, 1, K)
+        # --- Gather local alpha weights per-channel ---
+        # Build indices for K dimension: start + [0..p]
+        offs = torch.arange(0, self.p + 1, device=x.device).view(*(1,)*4 + (self.p + 1,))  # (1,1,1,1,p+1)
+        idx = (start.unsqueeze(-1) + offs).clamp_(0, self.K - 1)                            # (B,C,H,W,p+1)
+
+        # alpha: (C, K) -> (1,C,1,1,K)
         alpha = self.alpha.view(1, C, 1, 1, self.K)
-        spline_val = (basis * alpha).sum(dim=-1)  # (B, C, H, W)
+        alpha_loc = torch.gather(alpha.expand(B, -1, H, W, -1), dim=-1, index=idx)         # (B,C,H,W,p+1)
+
+        spline_val = (N * alpha_loc).sum(dim=-1)  # (B,C,H,W)
 
         y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
         return y
 
     def sobolev_penalty(self):
-        """
-        Sobolev-like smoothness on spline coefficients: L2 of discrete 2nd derivative of alpha along k.
-        """
         # alpha: (C, K)
-        d1 = self.alpha[:, 1:] - self.alpha[:, :-1]          # (C, K-1)
-        d2 = d1[:, 1:] - d1[:, :-1]                          # (C, K-2)
+        d1 = self.alpha[:, 1:] - self.alpha[:, :-1]
+        d2 = d1[:, 1:] - d1[:, :-1]
         return (d2 ** 2).mean()
 
 
@@ -268,7 +261,6 @@ class ResKANBlock(nn.Module):
         self.kan = KANSpline1D(in_ch, K=kan_K, degree=kan_degree)
         self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
 
-        # lightweight channel attention (SE) — ổn định, phổ biến trong restoration
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
@@ -278,14 +270,13 @@ class ResKANBlock(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, F, H, W)
-        z = self.dwt(x)                        # (B, 4F, H/2, W/2)
+        z = self.dwt(x)            # (B, 4F, H/2, W/2)
         z = self.conv1(z)
         z = self.kan(z)
         z = self.conv2(z)
         z = z * self.se(z)
-        y = self.idwt(z)                       # (B, F, H, W)
-        return x + y                           # residual
+        y = self.idwt(z)
+        return x + y
 
 
 # -------------------------
@@ -308,7 +299,7 @@ class ResKANNet(nn.Module):
         for blk in self.blocks:
             f = blk(f)
         out = self.recon(f)
-        return torch.clamp(inp + out, 0.0, 1.0)  # global residual + clamp an toàn
+        return torch.clamp(inp + out, 0.0, 1.0)
 
 
 # ---------------------------------------
@@ -385,11 +376,9 @@ class ResKANLightning(pl.LightningModule):
         psnr = self.val_psnr(pred, gt)
         ssim = self.val_ssim(pred, gt)
 
-        # yêu cầu: log val_psnr
         self.log("val_psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
         self.log("val_ssim", ssim, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
 
-        # cũng log val_loss để theo dõi
         val_loss = self.loss_charb(pred, gt)
         self.log("val_loss", val_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0))
 
