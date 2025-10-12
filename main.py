@@ -1,15 +1,35 @@
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from hydra.utils import instantiate
+from omegaconf import DictConfig
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+
 from utils.loader import Loader
+
+def setup(cfg: DictConfig) -> Trainer:
+    wandb_logger = WandbLogger(project="RESKAN")
+    ckpt_callback = ModelCheckpoint(monitor="val_psnr", mode="max", save_top_k=3)
+    trainer = Trainer(
+        max_epochs=cfg.max_epochs,
+        logger=wandb_logger,
+        callbacks=[ckpt_callback],
+        accelerator=cfg.accelerator,
+        devices=cfg.devices,
+        gradient_clip_val=1.0,
+    )
+    return trainer
 
 @hydra.main(version_base=None, config_path="cfg", config_name="config")
 def main(cfg: DictConfig):
     loader = Loader(dataset_cfg=cfg.dataset, cfg=cfg.loader)
-    train_loader = loader.train_dataloader()
+    trainer = setup(cfg.trainer)
 
-    for x, y in train_loader:
-        print(f"x: {x.shape}, y: {y.shape}")
-        break
-        
+    model = instantiate(cfg.model)
+    train_loader = loader.train_dataloader()
+    val_loader = loader.val_dataloader()
+
+    trainer.fit(model, train_loader, val_loader)
+  
 if __name__ == "__main__":
     main()

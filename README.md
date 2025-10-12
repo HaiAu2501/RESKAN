@@ -37,3 +37,32 @@ You should structure your dataset folder as follows:
 - Ensure that filenames in `<ground_truth>` and `<low_quality>` match for corresponding image pairs.
 
 If the dataset you want to use is not already included in the `cfg/dataset` folder, create a new YAML configuration file in the `cfg/dataset` directory. Use the naming convention `<your_dataset_name>.yaml`.
+
+## Quick Start
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/HaiAu2501/RESKAN.git
+cd RESKAN
+```
+
+2. Install the required dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+3. Prepare your dataset following the structure mentioned above.
+
+4. Run the main script with your dataset configuration:
+
+```bash
+python main.py \
+       dataset=<your_dataset> \
+       dataset.root=<dataset_root> \
+       dataset.lq_dirname=<low_quality> \
+       dataset.gt_dirname=<ground_truth> \
+       dataset.patch_size=<patch_size> \
+       loader.batch_size=<batch_size> \
+```

@@ -9,7 +9,12 @@ verbose: True
 
 loader:
   type: paired_dataset
-  batch_size: 16
+  batch_size: 4
   num_workers: 4
   shuffle: True
   val_ratio: 0.1
+
+trainer:
+  max_epochs: 100
+  accelerator: gpu
+  devices: 1

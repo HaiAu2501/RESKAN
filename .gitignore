@@ -7,3 +7,4 @@ NOTE.md
 bin/
 outputs/
 .private/
+wandb/

@@ -1,254 +1,401 @@
-from typing import Optional, Tuple, Union, Dict, Any
+# reskan_lightning.py
+import math
+from typing import List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import lightning.pytorch as pl
+import pytorch_lightning as pl
+
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-class KANSpline1D(nn.Module):
-    def __init__(self, channels: int, K: int = 16, init_identity: bool = True):
+
+# ----------------------------
+#  Utilities: Charbonnier + TV
+# ----------------------------
+class CharbonnierLoss(nn.Module):
+    def __init__(self, eps: float = 1e-3, reduction: str = "mean"):
         super().__init__()
-        self.channels = channels
-        self.K = K
+        self.eps = eps
+        self.reduction = reduction
 
-        centers = torch.linspace(-1.0, 1.0, K)
-        delta = 2.0 / (K - 1)
-        self.register_buffer("centers", centers[None, None, :, None, None])  # (1,1,K,1,1)
-        self.register_buffer("delta", torch.tensor(delta))
-
-        self.alpha = nn.Parameter(torch.zeros(channels, K))  # (C, K)
-        self.beta = nn.Parameter(torch.ones(channels, 1))    # linear skip
-        self.bias = nn.Parameter(torch.zeros(channels, 1))   # bias
-
-        # Per-channel affine pre-normalization: t = clamp(s*(x - m), [-1.5, 1.5])
-        self.shift = nn.Parameter(torch.zeros(channels, 1))
-        self.scale = nn.Parameter(torch.ones(channels, 1))
-
-        if init_identity:
-            nn.init.zeros_(self.alpha)
-            with torch.no_grad():
-                self.beta.fill_(1.0)
-                self.bias.zero_()
-                self.shift.zero_()
-                self.scale.fill_(1.0)
-
-    @staticmethod
-    def _hat(x: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(1.0 - x.abs(), min=0.0)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        film: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> torch.Tensor:
-        B, C, H, W = x.shape
-        assert C == self.channels, f"Expected C={self.channels}, got {C}"
-
-        t = (x - self.shift.view(1, C, 1, 1)) * self.scale.view(1, C, 1, 1)
-        if film is not None:
-            gamma, delta = film
-            t = (1.0 + gamma) * t + delta
-        t = torch.clamp(t, -1.5, 1.5)
-
-        t_exp = t.unsqueeze(2)                               # (B,C,1,H,W)
-        u = (t_exp - self.centers) / self.delta              # (B,C,K,H,W)
-        basis = self._hat(u)
-
-        phi = torch.einsum('bckhw,ck->bchw', basis, self.alpha)
-        phi = phi + self.beta.view(1, C, 1, 1) * x + self.bias.view(1, C, 1, 1)
-        return phi
-
-    def sobolev_smoothness(self) -> torch.Tensor:
-        if self.K < 3:
-            return self.alpha.new_zeros(())
-        d2 = self.alpha[:, :-2] - 2 * self.alpha[:, 1:-1] + self.alpha[:, 2:]
-        return (d2.pow(2).mean())
-
-class KANProxBlock(nn.Module):
-    def __init__(self, channels: int, hidden: int = 64, K: int = 16, use_cond: bool = False):
-        super().__init__()
-        self.use_cond = use_cond
-        self.analysis = nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=True)
-        self.kan = KANSpline1D(hidden, K=K, init_identity=True)
-        self.synthesis = nn.Conv2d(hidden, channels, kernel_size=3, padding=1, bias=True)
-
-        self.gate = nn.Parameter(torch.zeros(1))  # scalar gate (sigmoid)
-
-        if use_cond:
-            self.cond_proj = nn.Sequential(
-                nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(hidden, 2 * hidden, kernel_size=1, bias=True)
-            )
+    def forward(self, pred, target):
+        diff = pred - target
+        loss = torch.sqrt(diff * diff + self.eps * self.eps)
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
         else:
-            self.cond_proj = None
+            return loss
 
-        nn.init.kaiming_uniform_(self.analysis.weight, a=1.0)
-        nn.init.kaiming_uniform_(self.synthesis.weight, a=1.0)
-        nn.init.zeros_(self.analysis.bias)
-        nn.init.zeros_(self.synthesis.bias)
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        y = self.analysis(x)
+def tv_l1(x):
+    """Total variation L1 (nhẹ, optional)."""
+    loss = (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
+    return loss
 
-        film = None
-        if self.use_cond and (cond is not None):
-            cd = self.cond_proj(cond)                 # (B, 2*hidden, H, W)
-            cd = F.adaptive_avg_pool2d(cd, 1)        # (B, 2*hidden, 1, 1)
-            hidden = y.shape[1]
-            gamma, delta = cd.split(hidden, dim=1)   # (B, hidden, 1, 1)
-            film = (gamma, delta)
 
-        z = self.kan(y, film=film)                   # (B, hidden, H, W)
-        o = self.synthesis(z)                        # (B, C, H, W)
-
-        g = torch.sigmoid(self.gate)                 # scalar in (0,1)
-        out = x + g * (o - x)
-        return out, self.kan.sobolev_smoothness()
-
-class KANRestorationNet(nn.Module):
-    def __init__(self, in_channels: int = 3, hidden: int = 64, num_blocks: int = 6, K: int = 16, use_cond: bool = False):
+# --------------------------------------
+#  Fixed Haar Wavelet DWT / iDWT blocks
+# --------------------------------------
+class HaarDWT2D(nn.Module):
+    """
+    Depthwise DWT với Haar (stride=2). In: (B, F, H, W) -> Out: (B, 4F, H/2, W/2)
+    """
+    def __init__(self, channels: int):
         super().__init__()
+        Fch = channels
+        h = torch.tensor([1.0 / math.sqrt(2), 1.0 / math.sqrt(2)])
+        g = torch.tensor([1.0 / math.sqrt(2), -1.0 / math.sqrt(2)])
+        ll = torch.einsum('i,j->ij', h, h)  # 2x2
+        lh = torch.einsum('i,j->ij', h, g)
+        hl = torch.einsum('i,j->ij', g, h)
+        hh = torch.einsum('i,j->ij', g, g)
+        # Make 4 filters per channel
+        weight = torch.stack([ll, lh, hl, hh], dim=0)  # (4, 2, 2)
+        weight = weight.unsqueeze(1)  # (4, 1, 2, 2)
+        weight = weight.repeat(Fch, 1, 1, 1)  # (4F, 1, 2, 2)
+        self.register_buffer("weight", weight)
+        self.groups = Fch
+        self.conv = nn.Conv2d(in_channels=Fch, out_channels=4 * Fch, kernel_size=2, stride=2,
+                              padding=0, groups=Fch, bias=False)
+        with torch.no_grad():
+            self.conv.weight.copy_(self.weight)
+        for p in self.conv.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        if H % 2 != 0 or W % 2 != 0:
+            # pad reflect nếu kích thước lẻ
+            x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
+        return self.conv(x)
+
+
+class HaarIDWT2D(nn.Module):
+    """
+    Depthwise iDWT với Haar (stride=2). In: (B, 4F, H, W) -> Out: (B, F, 2H, 2W)
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        Fch = channels
+        h = torch.tensor([1.0 / math.sqrt(2), 1.0 / math.sqrt(2)])
+        g = torch.tensor([1.0 / math.sqrt(2), -1.0 / math.sqrt(2)])
+        ll = torch.einsum('i,j->ij', h, h)
+        lh = torch.einsum('i,j->ij', h, g)
+        hl = torch.einsum('i,j->ij', g, h)
+        hh = torch.einsum('i,j->ij', g, g)
+        # transpose-conv weight shape: (in_channels, out_channels_per_group, kH, kW)
+        weight = torch.stack([ll, lh, hl, hh], dim=0)  # (4, 2, 2)
+        weight = weight.unsqueeze(1)  # (4, 1, 2, 2)
+        weight = weight.repeat(Fch, 1, 1, 1)  # (4F, 1, 2, 2)
+        self.register_buffer("weight", weight)
+        self.groups = Fch
+        # in_channels = 4F, out_channels = F, groups=F => weight (4F, 1, 2, 2)
+        self.deconv = nn.ConvTranspose2d(in_channels=4 * Fch, out_channels=Fch, kernel_size=2, stride=2,
+                                         padding=0, groups=Fch, bias=False)
+        with torch.no_grad():
+            self.deconv.weight.copy_(self.weight)
+        for p in self.deconv.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        return self.deconv(x)
+
+
+# --------------------------------
+#  KAN 1D spline (per-feature)
+# --------------------------------
+def _open_uniform_knots(K: int, degree: int, low: float = -1.0, high: float = 1.0, device=None):
+    """
+    Open-uniform knot vector: [low,...(p+1), interior..., high...(p+1)], total length = K+degree+1.
+    Requires K >= degree+1; if not, we still build clamped extremes.
+    """
+    p = degree
+    assert K >= p + 1, f"K must be >= degree+1; got K={K}, degree={p}"
+    n_interior = K - p - 1
+    if n_interior > 0:
+        interior = torch.linspace(low, high, n_interior + 2, device=device)[1:-1]
+        knots = torch.cat([
+            torch.full((p + 1,), low, device=device),
+            interior,
+            torch.full((p + 1,), high, device=device)
+        ], dim=0)
+    else:
+        # No interior knots, just clamped ends
+        knots = torch.cat([
+            torch.full((p + 1,), low, device=device),
+            torch.full((p + 1,), high, device=device)
+        ], dim=0)
+    return knots  # shape: (K + p + 1,)
+
+
+def _bspline_basis(x: torch.Tensor, knots: torch.Tensor, degree: int) -> torch.Tensor:
+    """
+    Cox–de Boor. x: (...), knots: (K+p+1,), degree=p.
+    Returns basis B: (..., K)
+    """
+    p = degree
+    K = knots.numel() - p - 1  # number of basis
+    *spatial, = x.shape
+    # N for p=0 has length (K+p)
+    L = K + p
+    # Expand dims for broadcasting with i-index
+    x_exp = x.unsqueeze(-1)  # (..., 1)
+    # Indicator for N_{i,0}
+    t0 = knots[:-1]  # (K+p,)
+    t1 = knots[1:]   # (K+p,)
+    # shape-broadcast to (..., L)
+    N = ((x_exp >= t0) & (x_exp < t1)).to(x.dtype)
+    # Special case include right boundary at the last knot:
+    N = torch.where((x_exp == knots[-1]), torch.cat([torch.zeros_like(N[..., :L-1]), torch.ones_like(N[..., :1])], dim=-1), N)
+
+    # recursion
+    for r in range(1, p + 1):
+        Lr = K + p - (r - 1)      # current length
+        # after update, new length will be Lr-1
+        left_den = (knots[r: r + Lr - 1] - knots[:Lr - 1])  # (Lr-1,)
+        right_den = (knots[r + 1: r + 1 + Lr - 1] - knots[1: Lr])  # (Lr-1,)
+
+        left_num = x_exp - knots[:Lr - 1]           # (..., Lr-1)
+        right_num = knots[r + 1: r + 1 + Lr - 1] - x_exp  # (..., Lr-1)
+
+        left = torch.zeros_like(N[..., :Lr - 1])
+        right = torch.zeros_like(N[..., :Lr - 1])
+
+        nonzero = left_den != 0
+        if nonzero.any():
+            left = torch.where(
+                nonzero,
+                (left_num / left_den) * N[..., :Lr - 1],
+                left
+            )
+
+        nonzero2 = right_den != 0
+        if nonzero2.any():
+            right = torch.where(
+                nonzero2,
+                (right_num / right_den) * N[..., 1:Lr],
+                right
+            )
+        N = left + right  # (..., Lr-1)
+
+    # N now has shape (..., K)
+    return N
+
+
+class KANSpline1D(nn.Module):
+    """
+    KAN 1D per-feature: phi_c(x) = id_gain_c * x + bias_c + sum_k alpha_{c,k} * B_{k,p}(a_c * x + b_c)
+    - Shared over spatial positions; separate per-channel parameters.
+    - Stable init: identity (id_gain=1, alpha=0, a=1, b=0).
+    """
+    def __init__(self, channels: int, K: int = 16, degree: int = 3):
+        super().__init__()
+        assert K >= degree + 1, "K must be >= degree+1 for open-uniform spline."
+        self.C = channels
+        self.K = K
+        self.degree = degree
+
+        # per-channel affine to map input to [-1,1] domain
+        self.a = nn.Parameter(torch.ones(channels))   # scale
+        self.b = nn.Parameter(torch.zeros(channels))  # shift
+
+        # spline weights alpha (C, K)
+        self.alpha = nn.Parameter(torch.zeros(channels, K))
+
+        # linear skip + bias
+        self.id_gain = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+        # knot vector (fixed, on device later)
+        self.register_buffer("knots_base", None, persistent=False)
+
+    def _get_knots(self, device):
+        if (self.knots_base is None) or (self.knots_base.device != device):
+            self.knots_base = _open_uniform_knots(self.K, self.degree, low=-1.0, high=1.0, device=device)
+        return self.knots_base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, H, W) with C=self.C
+        """
+        B, C, H, W = x.shape
+        assert C == self.C
+        device = x.device
+        knots = self._get_knots(device)
+
+        # per-channel affine: x' = a_c * x + b_c
+        x_aff = x * self.a.view(1, C, 1, 1) + self.b.view(1, C, 1, 1)
+        # clamp (optional, ổn định đầu kỳ):
+        x_aff = torch.clamp(x_aff, -1.5, 1.5)
+
+        # B-spline basis at every pixel, per channel
+        # basis: (B, C, H, W, K)
+        basis = _bspline_basis(x_aff, knots, self.degree)  # (B, C, H, W, K)
+
+        # weight alpha per channel: (1, C, 1, 1, K)
+        alpha = self.alpha.view(1, C, 1, 1, self.K)
+        spline_val = (basis * alpha).sum(dim=-1)  # (B, C, H, W)
+
+        y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
+        return y
+
+    def sobolev_penalty(self):
+        """
+        Sobolev-like smoothness on spline coefficients: L2 of discrete 2nd derivative of alpha along k.
+        """
+        # alpha: (C, K)
+        d1 = self.alpha[:, 1:] - self.alpha[:, :-1]          # (C, K-1)
+        d2 = d1[:, 1:] - d1[:, :-1]                          # (C, K-2)
+        return (d2 ** 2).mean()
+
+
+# -------------------------
+#  ResKAN Residual Block
+# -------------------------
+class ResKANBlock(nn.Module):
+    def __init__(self, feat_ch: int, kernel_size: int = 3, kan_K: int = 16, kan_degree: int = 3):
+        super().__init__()
+        self.dwt = HaarDWT2D(feat_ch)
+        self.idwt = HaarIDWT2D(feat_ch)
+
+        in_ch = 4 * feat_ch
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
+        self.kan = KANSpline1D(in_ch, K=kan_K, degree=kan_degree)
+        self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
+
+        # lightweight channel attention (SE) — ổn định, phổ biến trong restoration
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, F, H, W)
+        z = self.dwt(x)                        # (B, 4F, H/2, W/2)
+        z = self.conv1(z)
+        z = self.kan(z)
+        z = self.conv2(z)
+        z = z * self.se(z)
+        y = self.idwt(z)                       # (B, F, H, W)
+        return x + y                           # residual
+
+
+# -------------------------
+#  Full ResKAN Network
+# -------------------------
+class ResKANNet(nn.Module):
+    def __init__(self, in_ch: int = 3, feat_ch: int = 64, num_blocks: int = 8,
+                 kan_K: int = 16, kan_degree: int = 3):
+        super().__init__()
+        self.shallow = nn.Conv2d(in_ch, feat_ch, kernel_size=3, padding=1)
         self.blocks = nn.ModuleList([
-            KANProxBlock(in_channels, hidden=hidden, K=K, use_cond=use_cond) for _ in range(num_blocks)
+            ResKANBlock(feat_ch, kernel_size=3, kan_K=kan_K, kan_degree=kan_degree)
+            for _ in range(num_blocks)
         ])
-        self.use_cond = use_cond
-        self._last_spline_penalty: Optional[torch.Tensor] = None
+        self.recon = nn.Conv2d(feat_ch, in_ch, kernel_size=3, padding=1)
 
-    def forward(self, x: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        penalties = []
-        h = x
+    def forward(self, x):
+        inp = x
+        f = self.shallow(x)
         for blk in self.blocks:
-            h, p = blk(h, cond if self.use_cond else None)
-            penalties.append(p)
-        self._last_spline_penalty = torch.stack(penalties).mean()
-        return h
+            f = blk(f)
+        out = self.recon(f)
+        return torch.clamp(inp + out, 0.0, 1.0)  # global residual + clamp an toàn
 
-    def sobolev_regularizer(self, lam: float = 1e-3) -> torch.Tensor:
-        p = getattr(self, "_last_spline_penalty", None)
-        if p is None:
-            ps = [blk.kan.sobolev_smoothness() for blk in self.blocks]
-            p = torch.stack(ps).mean()
-        return lam * p
 
-class LitKANRestoration(pl.LightningModule):
+# ---------------------------------------
+#  LightningModule: training + validation
+# ---------------------------------------
+class ResKANLightning(pl.LightningModule):
     def __init__(
         self,
-        in_channels: int = 3,
-        hidden: int = 64,
-        num_blocks: int = 6,
-        K: int = 16,
-        use_cond: bool = False,
+        in_ch: int = 3,
+        feat_ch: int = 64,
+        num_blocks: int = 8,
+        kan_K: int = 16,
+        kan_degree: int = 3,
         lr: float = 2e-4,
-        weight_decay: float = 0.0,
-        lam_spline: float = 1e-3,
-        data_range: float = 1.0,
-        loss_type: str = "mse",
+        wd: float = 1e-8,
+        lambda_charb: float = 1.0,
+        lambda_l1: float = 0.5,
+        lambda_tv: float = 0.0,
+        lambda_sobolev: float = 1e-4,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.net = KANRestorationNet(
-            in_channels=in_channels,
-            hidden=hidden,
-            num_blocks=num_blocks,
-            K=K,
-            use_cond=use_cond
+        self.net = ResKANNet(
+            in_ch=in_ch, feat_ch=feat_ch, num_blocks=num_blocks,
+            kan_K=kan_K, kan_degree=kan_degree
         )
 
-        # Loss
-        if loss_type.lower() == "l1":
-            self.crit = nn.L1Loss()
-        else:
-            self.crit = nn.MSELoss()
+        self.loss_charb = CharbonnierLoss(eps=1e-3)
+        self.loss_l1 = nn.L1Loss()
 
-        # Metrics
-        self.psnr = PeakSignalNoiseRatio(data_range=data_range)
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=data_range)
+        self.val_psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.val_ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
 
-        self.lam_spline = lam_spline
         self.lr = lr
-        self.weight_decay = weight_decay
-        self.use_cond = use_cond
+        self.wd = wd
+        self.lambda_charb = lambda_charb
+        self.lambda_l1 = lambda_l1
+        self.lambda_tv = lambda_tv
+        self.lambda_sobolev = lambda_sobolev
 
-    # ------------- utils -------------
-    @staticmethod
-    def _parse_batch(
-        batch: Union[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if isinstance(batch, (list, tuple)):
-            if len(batch) == 3:
-                y, x, cond = batch
-            elif len(batch) == 2:
-                y, x = batch
-                cond = None
-            else:
-                raise ValueError("Expected batch as (y, x) or (y, x, cond)")
-        elif isinstance(batch, dict):
-            # Be generous with possible key names
-            y = batch.get("y", None) or batch.get("input", None) or batch.get("degraded", None) or batch.get("noisy", None)
-            x = batch.get("x", None) or batch.get("target", None) or batch.get("gt", None)
-            cond = batch.get("cond", None)
-            if y is None or x is None:
-                raise ValueError("Dict batch must include y/input/degraded and x/target/gt")
-        else:
-            raise TypeError("Unsupported batch type")
-        return y, x, cond
+    def forward(self, x):
+        return self.net(x)
 
-    # ------------- forward -------------
-    def forward(self, y: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
-        return self.net(y, cond=cond if self.use_cond else None)
+    def _kan_sobolev_penalty(self):
+        pen = 0.0
+        for m in self.net.modules():
+            if isinstance(m, KANSpline1D):
+                pen = pen + m.sobolev_penalty()
+        return pen
 
-    # ------------- steps -------------
-    def _shared_step(self, batch: Any, stage: str) -> torch.Tensor:
-        y, x, cond = self._parse_batch(batch)
-        x_hat = self(y, cond)
-        data_loss = self.crit(x_hat, x)
-        reg = self.net.sobolev_regularizer(self.lam_spline)
-        loss = data_loss + reg
+    def training_step(self, batch, batch_idx):
+        lq, gt = batch  # (B,C,H,W) in [0,1]
+        pred = self(lq)
 
-        # Always log losses
-        self.log(f"{stage}/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=y.size(0))
-        self.log(f"{stage}/data_loss", data_loss, on_step=True, on_epoch=True, batch_size=y.size(0))
-        self.log(f"{stage}/spline_reg", reg, on_step=True, on_epoch=True, batch_size=y.size(0))
+        loss = 0.0
+        if self.lambda_charb > 0:
+            loss = loss + self.lambda_charb * self.loss_charb(pred, gt)
+        if self.lambda_l1 > 0:
+            loss = loss + self.lambda_l1 * self.loss_l1(pred, gt)
+        if self.lambda_tv > 0:
+            loss = loss + self.lambda_tv * tv_l1(pred)
+        if self.lambda_sobolev > 0:
+            loss = loss + self.lambda_sobolev * self._kan_sobolev_penalty()
 
-        # Metrics: compute for val/test (train metrics can be noisy/slow)
-        if stage in ("val", "test"):
-            psnr = self.psnr(x_hat, x)
-            ssim = self.ssim(x_hat, x)
-            self.log(f"{stage}/psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=y.size(0))
-            self.log(f"{stage}/ssim", ssim, prog_bar=True, on_step=False, on_epoch=True, batch_size=y.size(0))
-
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=lq.size(0))
         return loss
 
-    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
-        return self._shared_step(batch, "train")
+    def validation_step(self, batch, batch_idx):
+        lq, gt = batch
+        pred = self(lq).clamp(0, 1)
+        gt = gt.clamp(0, 1)
 
-    def validation_step(self, batch: Any, batch_idx: int) -> None:
-        self._shared_step(batch, "val")
+        psnr = self.val_psnr(pred, gt)
+        ssim = self.val_ssim(pred, gt)
 
-    def test_step(self, batch: Any, batch_idx: int) -> None:
-        self._shared_step(batch, "test")
+        # yêu cầu: log val_psnr
+        self.log("val_psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
+        self.log("val_ssim", ssim, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
 
-    # ------------- optim -------------
+        # cũng log val_loss để theo dõi
+        val_loss = self.loss_charb(pred, gt)
+        self.log("val_loss", val_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0))
+
+        return {"val_psnr": psnr, "val_ssim": ssim}
+
     def configure_optimizers(self):
-        optim = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        # Optional: cosine or step scheduler (comment in if desired)
-        # sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=self.trainer.max_epochs)
-        # return {"optimizer": optim, "lr_scheduler": sched}
-        return optim
-
-if __name__ == "__main__":
-    B, C, H, W = 2, 3, 64, 64
-    y = torch.randn(B, C, H, W)        # degraded / noisy
-    x = torch.randn_like(y)            # ground-truth
-    cond = torch.randn(B, C, H, W)     # optional conditioning (or None)
-
-    model = LitKANRestoration(
-        in_channels=C, hidden=64, num_blocks=4, K=16, use_cond=True,
-        lr=2e-4, lam_spline=1e-3, data_range=1.0, loss_type="mse"
-    )
-
-    with torch.no_grad():
-        x_hat = model(y, cond)
-        print("Out shape:", x_hat.shape)
+        opt = torch.optim.AdamW(self.parameters(), lr=self.lr, betas=(0.9, 0.99), weight_decay=self.wd)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200, eta_min=self.lr * 0.1)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
