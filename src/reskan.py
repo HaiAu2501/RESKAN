@@ -175,75 +175,79 @@ def _bspline_local_values(x: torch.Tensor, knots: torch.Tensor, K: int, p: int):
 #  KAN 1D spline (per-feature)
 #  ==> Memory-efficient version
 # --------------------------------
-class KANSpline1D(nn.Module):
+class KANCubic1D(nn.Module):
     """
-    KAN 1D per-feature (memory-efficient):
-    phi_c(x) = id_gain_c * x + bias_c + sum_{j=0..p} alpha_{c, start+j} * N_j(x)
-    - Only (p+1) local basis values per pixel (vs. K previously).
-    - Shared knots across channels; per-channel scale/shift 'a','b' map inputs to [-1,1].
+    KAN 1D cubic cardinal B-spline (degree=3), memory-safe & no in-place.
+    phi_c(x) = id_gain_c * x + bias_c + sum_{j=0..3} alpha_{c, i+j-1} * B_j(t),
+    với i = floor(u), t = u - i, u map từ [-1,1] -> [0, K-1].
     """
-    def __init__(self, channels: int, K: int = 16, degree: int = 3, clamp_val: float = 1.5):
+    def __init__(self, channels: int, K: int = 32, clamp_val: float = 1.5):
         super().__init__()
-        assert K >= degree + 1, "K must be >= degree+1 for open-uniform spline."
+        assert K >= 4, "Cubic cần K >= 4"
         self.C = channels
         self.K = K
-        self.p = degree
         self.clamp_val = clamp_val
-
-        # per-channel affine to map input to [-1,1]
-        self.a = nn.Parameter(torch.ones(channels))   # scale
-        self.b = nn.Parameter(torch.zeros(channels))  # shift
-
-        # spline weights alpha (C, K)
+        # map per-channel: a*x + b để phủ [-1,1]
+        self.a = nn.Parameter(torch.ones(channels))
+        self.b = nn.Parameter(torch.zeros(channels))
+        # spline weights
         self.alpha = nn.Parameter(torch.zeros(channels, K))
-
-        # linear skip + bias
+        # skip linear + bias
         self.id_gain = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
+        # biên miền [-1,1]
+        self.register_buffer("low", torch.tensor(-1.0), persistent=False)
+        self.register_buffer("high", torch.tensor(1.0), persistent=False)
 
-        self.register_buffer("knots", None, persistent=False)
-
-    def _ensure_knots(self, device, dtype):
-        if (self.knots is None) or (self.knots.device != device) or (self.knots.dtype != dtype):
-            self.knots = _open_uniform_knots(self.K, self.p, low=-1.0, high=1.0, device=device, dtype=dtype)
+    @staticmethod
+    def _cubic_basis(t: torch.Tensor):
+        # t in [0,1], trả về (b0,b1,b2,b3) broadcast với shape t
+        t2 = t * t
+        t3 = t2 * t
+        b0 = (1 - 3*t + 3*t2 - t3) / 6.0
+        b1 = (4 - 6*t2 + 3*t3) / 6.0
+        b2 = (1 + 3*t + 3*t2 - 3*t3) / 6.0
+        b3 = t3 / 6.0
+        return b0, b1, b2, b3
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W) with C=self.C
-        """
+        # x: (B,C,H,W)
         B, C, H, W = x.shape
         assert C == self.C
-        self._ensure_knots(x.device, x.dtype)
-
-        # per-channel affine: x' = a_c * x + b_c, then clamp (ổn định)
+        # affine + clamp (không in-place)
         x_aff = x * self.a.view(1, C, 1, 1) + self.b.view(1, C, 1, 1)
         if self.clamp_val is not None:
             x_aff = torch.clamp(x_aff, -self.clamp_val, self.clamp_val)
 
-        # --- Local B-spline values (only p+1 per pixel) ---
-        # shape of N: (B, C, H, W, p+1); start: (B, C, H, W)
-        N, start = _bspline_local_values(x_aff, self.knots, self.K, self.p)
+        # map [-1,1] -> [0, K-1]
+        u = (x_aff - self.low) / (self.high - self.low) * (self.K - 1)
+        i = torch.floor(u).to(torch.long)              # (B,C,H,W)
+        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)        # [0,1]
 
-        # --- Gather local alpha weights per-channel ---
-        # Build indices for K dimension: start + [0..p]
-        offs = torch.arange(0, self.p + 1, device=x.device).view(*(1,)*4 + (self.p + 1,))  # (1,1,1,1,p+1)
-        idx = (start.unsqueeze(-1) + offs).clamp_(0, self.K - 1)                            # (B,C,H,W,p+1)
+        # 4 chỉ số lân cận, clamp biên (KHÔNG in-place)
+        i0 = (i - 1).clamp(0, self.K - 1)
+        i1 = i.clamp(0, self.K - 1)
+        i2 = (i + 1).clamp(0, self.K - 1)
+        i3 = (i + 2).clamp(0, self.K - 1)
 
-        # alpha: (C, K) -> (1,C,1,1,K)
-        alpha = self.alpha.view(1, C, 1, 1, self.K)
-        alpha_loc = torch.gather(alpha.expand(B, -1, H, W, -1), dim=-1, index=idx)         # (B,C,H,W,p+1)
+        # 4 weights cubic theo t
+        b0, b1, b2, b3 = self._cubic_basis(t)          # (B,C,H,W) each
 
-        spline_val = (N * alpha_loc).sum(dim=-1)  # (B,C,H,W)
+        # gather alpha theo 4 chỉ số (dùng take_along_dim/gather — không in-place)
+        alpha = self.alpha.view(1, C, 1, 1, self.K).expand(B, C, H, W, self.K)  # view an toàn (chỉ đọc)
+        a0 = torch.gather(alpha, -1, i0.unsqueeze(-1)).squeeze(-1)
+        a1 = torch.gather(alpha, -1, i1.unsqueeze(-1)).squeeze(-1)
+        a2 = torch.gather(alpha, -1, i2.unsqueeze(-1)).squeeze(-1)
+        a3 = torch.gather(alpha, -1, i3.unsqueeze(-1)).squeeze(-1)
 
+        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3      # (B,C,H,W)
         y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
         return y
 
     def sobolev_penalty(self):
-        # alpha: (C, K)
         d1 = self.alpha[:, 1:] - self.alpha[:, :-1]
         d2 = d1[:, 1:] - d1[:, :-1]
         return (d2 ** 2).mean()
-
 
 # -------------------------
 #  ResKAN Residual Block
@@ -258,13 +262,13 @@ class ResKANBlock(nn.Module):
         padding = kernel_size // 2
 
         self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
-        self.kan = KANSpline1D(in_ch, K=kan_K, degree=kan_degree)
+        self.kan = KANCubic1D(in_ch, K=32)  # degree=3 fixed, mạnh & gọn
         self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
 
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),  # <- KHÔNG inplace
             nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1),
             nn.Sigmoid()
         )
@@ -347,7 +351,7 @@ class ResKANLightning(pl.LightningModule):
     def _kan_sobolev_penalty(self):
         pen = 0.0
         for m in self.net.modules():
-            if isinstance(m, KANSpline1D):
+            if isinstance(m, KANCubic1D):
                 pen = pen + m.sobolev_penalty()
         return pen
 
