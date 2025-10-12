@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from utils.loader import Loader
 
-def setup(cfg: DictConfig) -> Trainer:
+def setup(cfg: DictConfig) -> tuple[Trainer, ModelCheckpoint]:
     wandb_logger = WandbLogger(project="RESKAN")
     ckpt_callback = ModelCheckpoint(monitor="val_psnr", mode="max", save_top_k=3)
     trainer = Trainer(
@@ -16,21 +16,24 @@ def setup(cfg: DictConfig) -> Trainer:
         callbacks=[ckpt_callback],
         accelerator=cfg.accelerator,
         devices=cfg.devices,
-        precision="16-mixed",
         gradient_clip_val=1.0,
     )
-    return trainer
+    return trainer, ckpt_callback
 
 @hydra.main(version_base=None, config_path="cfg", config_name="config")
 def main(cfg: DictConfig):
     loader = Loader(dataset_cfg=cfg.dataset, cfg=cfg.loader)
-    trainer = setup(cfg.trainer)
+    trainer, ckpt_callback = setup(cfg.trainer)
 
     model = instantiate(cfg.model)
     train_loader = loader.train_dataloader()
     val_loader = loader.val_dataloader()
 
     trainer.fit(model, train_loader, val_loader)
+
+    best_ckpt = ckpt_callback.best_model_path
+    test_loader = loader.test_dataloader()
+    trainer.test(test_loader, ckpt_path=best_ckpt)
   
 if __name__ == "__main__":
     main()
