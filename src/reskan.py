@@ -1,5 +1,6 @@
+# reskan_lite.py
 import math
-from typing import List, Tuple
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
 
 # ----------------------------
 #  Utilities: Charbonnier + TV
@@ -27,8 +29,12 @@ class CharbonnierLoss(nn.Module):
         else:
             return loss
 
+
 def tv_l1(x: torch.Tensor) -> torch.Tensor:
-    return (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
+    # anisotropic TV-L1
+    loss = (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
+    return loss
+
 
 # --------------------------------------
 #  Fixed Haar Wavelet DWT / iDWT blocks
@@ -56,9 +62,10 @@ class HaarDWT2D(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        if H % 2 != 0 or W % 2 != 0:
+        if (H % 2 != 0) or (W % 2 != 0):
             x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
         return self.conv(x)
+
 
 class HaarIDWT2D(nn.Module):
     """
@@ -84,58 +91,68 @@ class HaarIDWT2D(nn.Module):
     def forward(self, x):
         return self.deconv(x)
 
+
 # ---------------------------------------------------------
-#  KAN cubic dictionary (low-rank, shared across channels)
+#  KAN cubic basis (cardinal) utilities
 # ---------------------------------------------------------
-class KANCubicDict1D(nn.Module):
+def _cubic_basis(t: torch.Tensor):
+    # t in [0,1], return b0..b3 with shape broadcastable to t
+    t2 = t * t
+    t3 = t2 * t
+    b0 = (1 - 3*t + 3*t2 - t3) / 6.0
+    b1 = (4 - 6*t2 + 3*t3) / 6.0
+    b2 = (1 + 3*t + 3*t2 - 3*t3) / 6.0
+    b3 = t3 / 6.0
+    return b0, b1, b2, b3
+
+
+# ---------------------------------------------------------
+#  KAN-LOWRANK 1D cubic spline (shared dictionary)
+# ---------------------------------------------------------
+class KANLowRankCubic1D(nn.Module):
     """
-    Low-rank KAN: sử dụng R spline bậc-3 (dictionary dùng chung) và trộn theo kênh.
-    - Dictionary tham số hoá bằng nn.Embedding (K -> R) để gather cực kỳ gọn.
-    - Mỗi kênh c có vector trộn w_{c,:} \in R^R, cùng id_gain_c và bias_c.
-    - Vẫn có affine map per-channel để phủ [-1,1].
+    KAN 1D cubic cardinal B-spline (degree=3) với phân rã hạng thấp alpha = W @ D.
+    - C: số kênh
+    - K: số điểm điều khiển (knots)
+    - M: hạng (số "atoms") << C
+
+    y = id_gain * x + bias + sum_{j=0..3} alpha_{c, i+j-1} * B_j(t)
+    với i = floor(u), t = u - i, u map từ [-1,1] -> [0, K-1].
     """
-    def __init__(self, channels: int, K: int = 32, R: int = 8, clamp_val: float = 1.5):
+    def __init__(self, channels: int, K: int = 32, rank_m: int = 8, clamp_val: float = 1.5):
         super().__init__()
         assert K >= 4, "Cubic cần K >= 4"
         self.C = channels
         self.K = K
-        self.R = R
+        self.M = rank_m
         self.clamp_val = clamp_val
 
-        # Map per-channel: a*x + b để đưa về [-1,1]
+        # affine map per-channel: a*x + b (đưa về [-1,1])
         self.a = nn.Parameter(torch.ones(channels))
         self.b = nn.Parameter(torch.zeros(channels))
-
-        # Dictionary alpha: (K, R); Embedding giúp gather theo chỉ số i0..i3 nhanh/gọn.
-        self.alpha_table = nn.Embedding(K, R)
-        nn.init.zeros_(self.alpha_table.weight)  # khởi tạo gần tuyến tính qua id_gain
-
-        # Mixing per channel: (C, R)
-        self.mix = nn.Parameter(torch.zeros(channels, R))
-
-        # Skip linear + bias per channel
+        # low-rank factors
+        self.W = nn.Parameter(torch.randn(channels, rank_m) * 0.02)
+        self.D = nn.Parameter(torch.randn(rank_m, K) * 0.02)
+        # skip linear + bias
         self.id_gain = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
 
-        # Biên miền [-1,1]
+        # biên miền [-1,1]
         self.register_buffer("low", torch.tensor(-1.0), persistent=False)
         self.register_buffer("high", torch.tensor(1.0), persistent=False)
 
-    @staticmethod
-    def _cubic_basis(t: torch.Tensor):
-        # t in [0,1], trả về (b0,b1,b2,b3) broadcast với shape t
-        t2 = t * t
-        t3 = t2 * t
-        b0 = (1 - 3*t + 3*t2 - t3) / 6.0
-        b1 = (4 - 6*t2 + 3*t3) / 6.0
-        b2 = (1 + 3*t + 3*t2 - 3*t3) / 6.0
-        b3 = t3 / 6.0
-        return b0, b1, b2, b3
+    def _alpha(self) -> torch.Tensor:
+        # (C,K)
+        return self.W @ self.D
+
+    def sobolev_penalty(self) -> torch.Tensor:
+        # phạt độ cong trên D (atoms), ổn định & trơn
+        d1 = self.D[:, 1:] - self.D[:, :-1]
+        d2 = d1[:, 1:] - d1[:, :-1]
+        return (d2 ** 2).mean()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C, H, W)  --> y: (B, C, H, W)
-        """
+        # x: (B,C,H,W)
         B, C, H, W = x.shape
         assert C == self.C
 
@@ -146,200 +163,180 @@ class KANCubicDict1D(nn.Module):
 
         # map [-1,1] -> [0, K-1]
         u = (x_aff - self.low) / (self.high - self.low) * (self.K - 1)
-        i = torch.floor(u).to(torch.long)                # (B,C,H,W)
-        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)
+        i = torch.floor(u).to(torch.long)              # (B,C,H,W)
+        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)        # [0,1]
 
-        # 4 indices with boundary clamp
+        # 4 neighbor indices, clamp
         i0 = (i - 1).clamp(0, self.K - 1)
         i1 = i.clamp(0, self.K - 1)
         i2 = (i + 1).clamp(0, self.K - 1)
         i3 = (i + 2).clamp(0, self.K - 1)
 
         # cubic basis
-        b0, b1, b2, b3 = self._cubic_basis(t)  # (B,C,H,W)
+        b0, b1, b2, b3 = _cubic_basis(t)  # (B,C,H,W)
 
-        # gather alpha for each index via embedding: returns (..., R)
-        A0 = self.alpha_table(i0)  # (B,C,H,W,R)
-        A1 = self.alpha_table(i1)
-        A2 = self.alpha_table(i2)
-        A3 = self.alpha_table(i3)
+        # gather alpha at indices without materializing big tensors (only a view expand)
+        alpha = self._alpha().view(1, C, 1, 1, self.K).expand(B, C, H, W, self.K)  # view
+        a0 = torch.gather(alpha, -1, i0.unsqueeze(-1)).squeeze(-1)
+        a1 = torch.gather(alpha, -1, i1.unsqueeze(-1)).squeeze(-1)
+        a2 = torch.gather(alpha, -1, i2.unsqueeze(-1)).squeeze(-1)
+        a3 = torch.gather(alpha, -1, i3.unsqueeze(-1)).squeeze(-1)
 
-        # spline value per basis r
-        # shape (B,C,H,W,R)
-        spline_per_r = (
-            A0 * b0.unsqueeze(-1) +
-            A1 * b1.unsqueeze(-1) +
-            A2 * b2.unsqueeze(-1) +
-            A3 * b3.unsqueeze(-1)
-        )
-
-        # mix across R with per-channel weights: (C,R)
-        # output (B,C,H,W)
-        y_nl = torch.einsum('bchwr,cr->bchw', spline_per_r, self.mix)
-
-        y = self.id_gain.view(1, C, 1, 1) * x + y_nl + self.bias.view(1, C, 1, 1)
+        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3
+        y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
         return y
 
-    def sobolev_penalty(self) -> torch.Tensor:
-        """
-        Sobolev penalty trên các spline toàn cục (theo k).
-        alpha_table.weight: (K, R)
-        """
-        w = self.alpha_table.weight  # (K,R)
-        d1 = w[1:, :] - w[:-1, :]
-        d2 = d1[1:, :] - d1[:-1, :]
-        return (d2 ** 2).mean()
 
-    def group_lasso_penalty(self) -> torch.Tensor:
-        """
-        L_{2,1} trên mix (khuyến khích kênh dùng ít basis, giảm rank hiệu dụng).
-        """
-        # mix: (C,R) -> sum_c ||mix_c||_2
-        eps = 1e-8
-        norms = torch.sqrt((self.mix ** 2).sum(dim=1) + eps)  # (C,)
-        return norms.mean()
-
-# -------------------------
-#  Depthwise-Separable Conv
-# -------------------------
-class DSConv(nn.Module):
-    """
-    Depthwise 3x3 + Pointwise 1x1; chuẩn hoá nhẹ bằng GroupNorm để ổn định Lipschitz.
-    """
-    def __init__(self, ch: int, kernel_size: int = 3):
+# ---------------------------------------------------------
+#  Depthwise-Separable Conv block (DW + PW)
+# ---------------------------------------------------------
+class DW_PW_Conv(nn.Module):
+    def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
         padding = kernel_size // 2
-        self.dw = nn.Conv2d(ch, ch, kernel_size, padding=padding, groups=ch, bias=True)
-        self.pw = nn.Conv2d(ch, ch, kernel_size=1, bias=True)
-        self.gn = nn.GroupNorm(num_groups=min(32, ch), num_channels=ch)
+        self.dw = nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels, bias=True)
+        self.pw = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.act = nn.GELU()
 
     def forward(self, x):
-        y = self.dw(x)
-        y = F.relu(self.gn(self.pw(y)), inplace=False)
-        return y
+        x = self.dw(x)
+        x = self.act(x)
+        x = self.pw(x)
+        return x
+
 
 # -------------------------
-#  ResKAN Lite Residual Block
+#  KAN-Lite Residual Block
 # -------------------------
-class ResKANLiteBlock(nn.Module):
+class KANLiteBlock(nn.Module):
     """
-    - DWT/iDWT cố định (Haar).
-    - 2 DSConv nhẹ + KAN dictionary.
-    - SE gating + residual scaling s \in (0,1) để đảm bảo tính co.
+    Block nhẹ chạy ở độ phân giải thấp:
+    z -> DW-PW -> KANLowRankCubic1D -> DW-PW -> SE -> +res
     """
-    def __init__(self, feat_ch: int, kan_K: int = 32, kan_R: int = 8):
+    def __init__(self, feat_ch: int, kan_K: int = 32, kan_rank: int = 8):
         super().__init__()
-        self.dwt = HaarDWT2D(feat_ch)
-        self.idwt = HaarIDWT2D(feat_ch)
+        self.conv1 = DW_PW_Conv(feat_ch, 3)
+        self.kan = KANLowRankCubic1D(feat_ch, K=kan_K, rank_m=kan_rank)
+        self.conv2 = DW_PW_Conv(feat_ch, 3)
 
-        in_ch = 4 * feat_ch
-
-        self.conv1 = DSConv(in_ch, kernel_size=3)
-        self.kan = KANCubicDict1D(in_ch, K=kan_K, R=kan_R)
-        self.conv2 = DSConv(in_ch, kernel_size=3)
-
+        # SE nhỏ gọn
+        r = max(feat_ch // 16, 8)
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
-            nn.ReLU(inplace=False),
-            nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1),
-            nn.Sigmoid()
+            nn.Conv2d(feat_ch, r, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(r, feat_ch, kernel_size=1),
+            nn.Sigmoid(),
         )
 
-        # Residual scaling parameter s in (0,1)
-        self.res_scale_param = nn.Parameter(torch.tensor(0.0))  # sigmoid(0)=0.5 khởi tạo vừa phải
-
     def forward(self, x):
-        s = torch.sigmoid(self.res_scale_param)  # (scalar)
-        z = self.dwt(x)            # (B, 4F, H/2, W/2)
-        z = self.conv1(z)
+        z = self.conv1(x)
         z = self.kan(z)
         z = self.conv2(z)
         z = z * self.se(z)
-        y = self.idwt(z)
-        return x + s * y
+        return x + z
 
-    def regularizers(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        sob, gl = self.kan.sobolev_penalty(), self.kan.group_lasso_penalty()
-        return sob, gl
 
 # -------------------------
-#  Full Slim ResKAN Network
+#  Full ResKAN-Lite Network
 # -------------------------
-class SlimResKANNet(nn.Module):
+class ResKANLiteNet(nn.Module):
     """
-    - Một khối ResKANLite lặp T lần (weight sharing) để giảm params.
-    - Có thể bật 'share_block=False' nếu muốn khối khác nhau (tăng capacity).
+    Kiến trúc: Shallow -> DWT (1 lần) -> bottleneck (1x1) -> [N blocks @ low-res]
+               -> expand (1x1) -> IDWT -> Recon -> residual to input
     """
-    def __init__(self, in_ch: int = 3, feat_ch: int = 64, num_steps: int = 8,
-                 kan_K: int = 32, kan_R: int = 8, share_block: bool = True):
-        super().__init__()
-        self.shallow = nn.Conv2d(in_ch, feat_ch, kernel_size=3, padding=1)
-        self.num_steps = num_steps
-        self.share_block = share_block
-
-        if share_block:
-            self.block = ResKANLiteBlock(feat_ch, kan_K=kan_K, kan_R=kan_R)
-        else:
-            self.blocks = nn.ModuleList([
-                ResKANLiteBlock(feat_ch, kan_K=kan_K, kan_R=kan_R)
-                for _ in range(num_steps)
-            ])
-
-        self.recon = nn.Conv2d(feat_ch, in_ch, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        inp = x
-        f = self.shallow(x)
-        if self.share_block:
-            for _ in range(self.num_steps):
-                f = self.block(f)
-        else:
-            for blk in self.blocks:
-                f = blk(f)
-        out = self.recon(f)
-        return torch.clamp(inp + out, 0.0, 1.0)
-
-    def regularizers(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        sob = 0.0
-        gl = 0.0
-        if self.share_block:
-            s, g = self.block.regularizers()
-            sob = sob + s
-            gl = gl + g
-        else:
-            for blk in self.blocks:
-                s, g = blk.regularizers()
-                sob = sob + s
-                gl = gl + g
-        return sob, gl
-
-# ---------------------------------------
-#  LightningModule: training + validation
-# ---------------------------------------
-class SlimResKANLightning(pl.LightningModule):
     def __init__(
         self,
         in_ch: int = 3,
         feat_ch: int = 64,
-        num_steps: int = 8,
+        num_blocks: int = 8,
         kan_K: int = 32,
-        kan_R: int = 8,
-        share_block: bool = True,
+        kan_rank: int = 8,
+        bottleneck_ch: Optional[int] = None,
+        use_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.in_ch = in_ch
+        self.F = feat_ch
+        self.use_checkpoint = use_checkpoint
+
+        self.shallow = nn.Conv2d(in_ch, feat_ch, kernel_size=3, padding=1)
+
+        # One-shot wavelet analysis/synthesis
+        self.dwt = HaarDWT2D(feat_ch)
+        self.idwt = HaarIDWT2D(feat_ch)
+
+        # Bottleneck ở low-res để giảm kênh
+        in_low = 4 * feat_ch
+        self.Fm = bottleneck_ch if bottleneck_ch is not None else feat_ch  # thường = F
+        self.reduce = nn.Conv2d(in_low, self.Fm, kernel_size=1, bias=True)
+
+        # Stack blocks @ low-res
+        self.blocks = nn.ModuleList([
+            KANLiteBlock(self.Fm, kan_K=kan_K, kan_rank=kan_rank) for _ in range(num_blocks)
+        ])
+
+        # Expand kênh về 4F để iDWT
+        self.expand = nn.Conv2d(self.Fm, in_low, kernel_size=1, bias=True)
+
+        # Recon @ full-res
+        self.recon = nn.Conv2d(feat_ch, in_ch, kernel_size=3, padding=1)
+
+    def forward_lowres_stage(self, z):
+        if not self.use_checkpoint:
+            for blk in self.blocks:
+                z = blk(z)
+            return z
+        else:
+            # checkpoint từng block để giảm RAM đỉnh
+            from torch.utils.checkpoint import checkpoint
+            for blk in self.blocks:
+                z = checkpoint(blk, z)
+            return z
+
+    def forward(self, x):
+        inp = x
+        f = self.shallow(x)       # (B,F,H,W)
+        z = self.dwt(f)           # (B,4F,H/2,W/2)
+        z = self.reduce(z)        # (B,Fm,H/2,W/2)
+        z = self.forward_lowres_stage(z)
+        z = self.expand(z)        # (B,4F,H/2,W/2)
+        f2 = self.idwt(z)         # (B,F,H,W)
+        out = self.recon(f2)      # (B,in_ch,H,W)
+        return torch.clamp(inp + out, 0.0, 1.0)
+
+
+# ---------------------------------------
+#  LightningModule: training + validation
+# ---------------------------------------
+class ResKANLiteLightning(pl.LightningModule):
+    def __init__(
+        self,
+        in_ch: int = 3,
+        feat_ch: int = 64,
+        num_blocks: int = 8,
+        kan_K: int = 32,
+        kan_rank: int = 8,
+        bottleneck_ch: Optional[int] = None,
+        use_checkpoint: bool = False,
         lr: float = 2e-4,
         wd: float = 1e-8,
         lambda_charb: float = 1.0,
         lambda_l1: float = 0.5,
         lambda_tv: float = 0.0,
-        lambda_sobolev: float = 5e-4,
-        lambda_group: float = 1e-4,   # L_{2,1} cho mix (giảm rank hiệu dụng)
+        lambda_sobolev: float = 1e-4,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.net = SlimResKANNet(
-            in_ch=in_ch, feat_ch=feat_ch, num_steps=num_steps,
-            kan_K=kan_K, kan_R=kan_R, share_block=share_block
+        self.net = ResKANLiteNet(
+            in_ch=in_ch,
+            feat_ch=feat_ch,
+            num_blocks=num_blocks,
+            kan_K=kan_K,
+            kan_rank=kan_rank,
+            bottleneck_ch=bottleneck_ch,
+            use_checkpoint=use_checkpoint,
         )
 
         self.loss_charb = CharbonnierLoss(eps=1e-3)
@@ -354,14 +351,16 @@ class SlimResKANLightning(pl.LightningModule):
         self.lambda_l1 = lambda_l1
         self.lambda_tv = lambda_tv
         self.lambda_sobolev = lambda_sobolev
-        self.lambda_group = lambda_group
 
     def forward(self, x):
         return self.net(x)
 
-    def _regularization_terms(self):
-        sob, gl = self.net.regularizers()
-        return sob, gl
+    def _sobolev_penalty(self):
+        pen = 0.0
+        for m in self.net.modules():
+            if isinstance(m, KANLowRankCubic1D):
+                pen = pen + m.sobolev_penalty()
+        return pen
 
     def training_step(self, batch, batch_idx):
         lq, gt = batch  # (B,C,H,W) in [0,1]
@@ -374,16 +373,10 @@ class SlimResKANLightning(pl.LightningModule):
             loss = loss + self.lambda_l1 * self.loss_l1(pred, gt)
         if self.lambda_tv > 0:
             loss = loss + self.lambda_tv * tv_l1(pred)
-
-        sob, gl = self._regularization_terms()
         if self.lambda_sobolev > 0:
-            loss = loss + self.lambda_sobolev * sob
-        if self.lambda_group > 0:
-            loss = loss + self.lambda_group * gl
+            loss = loss + self.lambda_sobolev * self._sobolev_penalty()
 
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=lq.size(0))
-        self.log("reg_sobolev", sob, prog_bar=False, on_step=True, on_epoch=True, batch_size=lq.size(0))
-        self.log("reg_group", gl, prog_bar=False, on_step=True, on_epoch=True, batch_size=lq.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -408,7 +401,7 @@ class SlimResKANLightning(pl.LightningModule):
 
         psnr = self.val_psnr(pred, gt)
         ssim = self.val_ssim(pred, gt)
-        
+
         self.log("test_psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
         self.log("test_ssim", ssim, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
         return {"test_psnr": psnr, "test_ssim": ssim}
