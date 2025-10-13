@@ -1,1 +1,12 @@
 _target_: src.raw_reskan.ResKANLightning
+in_ch: 3
+feat_ch: 64
+num_blocks: 8
+kan_K: 16
+kan_degree: 3
+lr: 2e-4
+wd: 1e-8
+lambda_charb: 1.0
+lambda_l1: 0.5
+lambda_tv: 0.0
+lambda_sobolev: 1e-4
