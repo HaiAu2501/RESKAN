@@ -1,0 +1,16 @@
+_target_: src.new_reskan.ResKANPyrLightning
+in_ch: 3
+feat_ch: 128
+n_blocks_l1: 6
+n_blocks_l2: 12
+compress1: 0.5
+compress2: 0.5
+kan_K: 32
+kan_groups: 32
+use_checkpoint: False
+lr: 2e-4
+wd: 1e-8
+lambda_charb: 1.0
+lambda_l1: 0.5
+lambda_tv: 0.0
+lambda_sobolev: 1e-4

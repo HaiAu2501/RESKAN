@@ -1,6 +1,0 @@
-_target_: src.reskan.ResKANLiteLightning
-in_ch: 3
-feat_ch: 64
-num_blocks: 8
-kan_K: 32
-kan_rank: 8
