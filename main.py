@@ -33,7 +33,7 @@ def main(cfg: DictConfig):
 
     best_ckpt = ckpt_callback.best_model_path
     test_loader = loader.test_dataloader()
-    trainer.test(test_loader, ckpt_path=best_ckpt)
+    trainer.test(model, test_loader, ckpt_path=best_ckpt)
   
 if __name__ == "__main__":
     main()

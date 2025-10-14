@@ -18,10 +18,31 @@ class Loader:
         self.ds_train, self.ds_val = random_split(self.ds_full, [train_size, val_size])
         
     def train_dataloader(self):
-        return DataLoader(self.ds_train, batch_size=self.batch_size, shuffle=self.shuffle, num_workers=self.num_workers)
+        return DataLoader(
+            self.ds_train,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            persistent_workers=True
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.ds_val, batch_size=1, shuffle=False, num_workers=1)
+        return DataLoader(
+            self.ds_val,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+            persistent_workers=True
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.ds_test, batch_size=1, shuffle=False, num_workers=1)
+        return DataLoader(
+            self.ds_test,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+            persistent_workers=True
+        )

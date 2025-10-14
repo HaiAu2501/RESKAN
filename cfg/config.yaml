@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - dataset: example
-  - model: reskan
+  - model: raw_reskan
 
 seed: 42
 device: cuda
