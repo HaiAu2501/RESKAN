@@ -1,7 +1,6 @@
 .env/
 lightning_logs/
 __pycache__/
-*.ipynb
 NOTE.md
 *.png
 bin/
