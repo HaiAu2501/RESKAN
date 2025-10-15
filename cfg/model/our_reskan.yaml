@@ -1,4 +1,4 @@
-_target_: src.our_kan.ResKAN
+_target_: src.our_reskan.ResKAN
 mode: universal_unrolled
 in_ch: 3
 feat_ch: 48
