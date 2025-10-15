@@ -1,6 +1,6 @@
 # reskan.py 
 import math
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -30,9 +30,8 @@ class CharbonnierLoss(nn.Module):
             return loss
 
 
-def tv_l1(x):
-    loss = (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
-    return loss
+def tv_l1(x: torch.Tensor) -> torch.Tensor:
+    return (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
 
 
 # --------------------------------------
@@ -59,7 +58,7 @@ class HaarDWT2D(nn.Module):
         for p in self.conv.parameters():
             p.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         if H % 2 != 0 or W % 2 != 0:
             x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
@@ -87,40 +86,37 @@ class HaarIDWT2D(nn.Module):
         for p in self.deconv.parameters():
             p.requires_grad = False
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.deconv(x)
 
 
 # ---------------------------------------------------------
-#  Memory-efficient cubic B-spline KAN (degree=3), separable
+#  KAN: cubic B-spline 1D (degree=3), separable & memory-safe
 # ---------------------------------------------------------
 class KANCubic1D(nn.Module):
     """
-    KAN 1D cubic cardinal B-spline (degree=3), memory-safe & no in-place.
     phi_c(x) = id_gain_c * x + bias_c + sum_{j in {i-1,i,i+1,i+2}} alpha[c, j] * B_j(t),
-    với i = floor(u), t = u - i, u map từ [-1,1] -> [0, K-1].
+    i = floor(u), t = u - i, u = map([-1,1]->[0,K-1]).
+    Khởi tạo "hiền": id_gain=0, alpha=0, bias=0 => KAN ~ 0 lúc đầu.
     """
-    def __init__(self, channels: int, K: int = 32, clamp_val: Optional[float] = 1.5):
+    def __init__(self, channels: int, K: int = 32, clamp_val: Optional[float] = 6.0):
         super().__init__()
         assert K >= 4, "Cubic cần K >= 4"
         self.C = channels
         self.K = K
         self.clamp_val = clamp_val
-        # map per-channel: a*x + b để phủ [-1,1]
-        self.a = nn.Parameter(torch.ones(channels))
+
+        self.a = nn.Parameter(torch.ones(channels))       # giữ 1.0 để không bóp méo lớn
         self.b = nn.Parameter(torch.zeros(channels))
-        # spline weights
         self.alpha = nn.Parameter(torch.zeros(channels, K))
-        # skip linear + bias
-        self.id_gain = nn.Parameter(torch.ones(channels))
+        self.id_gain = nn.Parameter(torch.zeros(channels))  # <<< KHỞI TẠO 0.0
         self.bias = nn.Parameter(torch.zeros(channels))
-        # biên miền [-1,1]
+
         self.register_buffer("low", torch.tensor(-1.0), persistent=False)
         self.register_buffer("high", torch.tensor(1.0), persistent=False)
 
     @staticmethod
-    def _cubic_basis(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # t in [0,1], trả về (b0,b1,b2,b3) broadcast với shape t
+    def _cubic_basis(t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         t2 = t * t
         t3 = t2 * t
         b0 = (1 - 3*t + 3*t2 - t3) / 6.0
@@ -130,59 +126,47 @@ class KANCubic1D(nn.Module):
         return b0, b1, b2, b3
 
     def _gather_alpha_linear(self, idx: torch.Tensor) -> torch.Tensor:
-        """
-        Memory-efficient gather alpha[c, idx] for idx shape (B,C,H,W).
-        Avoids expanding to (B,C,H,W,K).
-        """
         B, C, H, W = idx.shape
         K = self.K
-        # channel indices per location
         c = torch.arange(C, device=idx.device).view(1, C, 1, 1).expand(B, C, H, W)
-        lin = c * K + idx  # linear index into alpha.view(-1)
-        out = torch.take(self.alpha.view(-1), lin.view(-1)).view(B, C, H, W)
-        return out
+        lin = c * K + idx
+        return torch.take(self.alpha.view(-1), lin.view(-1)).view(B, C, H, W)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,C,H,W)
         B, C, H, W = x.shape
         assert C == self.C
-        # affine + clamp (không in-place)
         x_aff = x * self.a.view(1, C, 1, 1) + self.b.view(1, C, 1, 1)
         if self.clamp_val is not None:
             x_aff = torch.clamp(x_aff, -self.clamp_val, self.clamp_val)
 
-        # map [-1,1] -> [0, K-1]
         u = (x_aff - self.low) / (self.high - self.low) * (self.K - 1)
-        i = torch.floor(u).to(torch.long)              # (B,C,H,W)
-        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)        # [0,1]
+        i = torch.floor(u).to(torch.long)
+        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)
 
-        # 4 chỉ số lân cận, clamp biên (KHÔNG in-place)
         i0 = (i - 1).clamp(0, self.K - 1)
         i1 = i.clamp(0, self.K - 1)
         i2 = (i + 1).clamp(0, self.K - 1)
         i3 = (i + 2).clamp(0, self.K - 1)
 
-        # 4 weights cubic theo t
-        b0, b1, b2, b3 = self._cubic_basis(t)          # (B,C,H,W) each
+        b0, b1, b2, b3 = self._cubic_basis(t)
 
-        # gather alpha theo 4 chỉ số bằng linear indexing — memory friendly
         a0 = self._gather_alpha_linear(i0)
         a1 = self._gather_alpha_linear(i1)
         a2 = self._gather_alpha_linear(i2)
         a3 = self._gather_alpha_linear(i3)
 
-        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3      # (B,C,H,W)
+        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3
         y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
         return y
 
-    def sobolev_penalty(self):
+    def sobolev_penalty(self) -> torch.Tensor:
         d1 = self.alpha[:, 1:] - self.alpha[:, :-1]
         d2 = d1[:, 1:] - d1[:, :-1]
         return (d2 ** 2).mean()
 
 
 # -------------------------
-#  ResKAN Residual Block
+#  ResKAN Residual Block (sửa rất nhỏ)
 # -------------------------
 class ResKANBlock(nn.Module):
     def __init__(self, feat_ch: int, kernel_size: int = 3, kan_K: int = 16, kan_degree: int = 3):
@@ -193,33 +177,56 @@ class ResKANBlock(nn.Module):
         in_ch = 4 * feat_ch
         padding = kernel_size // 2
 
-        # NHỎ nhưng quan trọng: conv1 chỉ trộn "trong từng subband" (groups=4).
-        # 4 nhóm, mỗi nhóm có feat_ch kênh tương ứng LL/LH/HL/HH.
-        self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=4, bias=True)
-
-        # SỬ DỤNG kan_K do người dùng truyền vào (sửa bug K=32 cố định)
-        self.kan = KANCubic1D(in_ch, K=kan_K)
-
-        # Giữ nguyên conv2 full-mix để bảo toàn capacity
+        # GIỮ groups=1 như bản gốc (không đổi kiến trúc)
+        self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
+        self.kan = KANCubic1D(in_ch, K=kan_K)  # dùng đúng kan_K người dùng truyền vào
         self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
 
-        # Giữ nguyên SE như cũ (đặt ở miền subband sau conv2, trước iDWT)
+        # SE giữ nguyên, nhưng bias cuối khởi tạo dương để gate≈1 lúc đầu
+        self.se_conv1 = nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1)
+        self.se_conv2 = nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1)
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
-            nn.ReLU(),  # KHÔNG inplace
-            nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1),
+            self.se_conv1,
+            nn.ReLU(),  # không inplace
+            self.se_conv2,
             nn.Sigmoid()
         )
 
-    def forward(self, x):
+        # Residual scaling để gần-identity nhưng có gradient
+        self.res_scale = nn.Parameter(torch.tensor(0.1))  # học được; init nhỏ
+
+        # Init cẩn thận để nhánh residual nhỏ nhưng không tắc gradient
+        self._init_weights()
+
+    def _init_weights(self):
+        # conv1, conv2: Kaiming, nhưng scale nhỏ cho conv2
+        nn.init.kaiming_normal_(self.conv1.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
+        if self.conv1.bias is not None:
+            nn.init.zeros_(self.conv1.bias)
+
+        nn.init.kaiming_normal_(self.conv2.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
+        with torch.no_grad():
+            self.conv2.weight.mul_(0.1)  # scale nhỏ để không phá identity ở init
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+
+        # SE gate ≈ 1 ở init (đừng bóp méo nhánh)
+        nn.init.kaiming_normal_(self.se_conv1.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
+        nn.init.zeros_(self.se_conv1.bias)
+        nn.init.zeros_(self.se_conv2.weight)
+        nn.init.constant_(self.se_conv2.bias, 2.0)  # sigmoid(2)~0.88
+
+        # KAN đã init "hiền": id_gain=0, alpha=0, bias=0 (ở lớp KAN)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.dwt(x)            # (B, 4F, H/2, W/2)
-        z = self.conv1(z)          # bandwise context (nhưng không trộn tất cả subbands)
-        z = self.kan(z)            # separable 1D shrinkage-like
-        z = self.conv2(z)          # full mixing lại để giữ sức biểu diễn
+        z = self.conv1(z)
+        z = self.kan(z)
+        z = self.conv2(z)
         z = z * self.se(z)
         y = self.idwt(z)
-        return x + y
+        return x + self.res_scale * y
 
 
 # -------------------------
@@ -236,14 +243,21 @@ class ResKANNet(nn.Module):
         ])
         self.recon = nn.Conv2d(feat_ch, in_ch, kernel_size=3, padding=1)
 
-        # (Tuỳ chọn rất nhỏ) init nhẹ nhàng để KAN gần tuyến tính lúc đầu
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        self._init_weights()
 
-    def forward(self, x):
+    def _init_weights(self):
+        # Shallow & recon: nhỏ để gần-identity nhưng vẫn cho gradient
+        nn.init.kaiming_normal_(self.shallow.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
+        if self.shallow.bias is not None:
+            nn.init.zeros_(self.shallow.bias)
+
+        nn.init.kaiming_normal_(self.recon.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
+        with torch.no_grad():
+            self.recon.weight.mul_(1e-2)  # rất nhỏ để out≈0 lúc đầu
+        if self.recon.bias is not None:
+            nn.init.zeros_(self.recon.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         inp = x
         f = self.shallow(x)
         for blk in self.blocks:
@@ -291,10 +305,10 @@ class ResKANLightning(pl.LightningModule):
         self.lambda_tv = lambda_tv
         self.lambda_sobolev = lambda_sobolev
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-    def _kan_sobolev_penalty(self):
+    def _kan_sobolev_penalty(self) -> torch.Tensor:
         pen = 0.0
         for m in self.net.modules():
             if isinstance(m, KANCubic1D):
@@ -309,7 +323,7 @@ class ResKANLightning(pl.LightningModule):
         if self.lambda_charb > 0:
             loss = loss + self.lambda_charb * self.loss_charb(pred, gt)
         if self.lambda_l1 > 0:
-            loss = loss + self.lambda_l1 * self.loss_l1(pred, gt)
+            loss = loss + self.lambda_l1 * nn.functional.l1_loss(pred, gt)
         if self.lambda_tv > 0:
             loss = loss + self.lambda_tv * tv_l1(pred)
         if self.lambda_sobolev > 0:
@@ -331,7 +345,6 @@ class ResKANLightning(pl.LightningModule):
 
         val_loss = self.loss_charb(pred, gt)
         self.log("val_loss", val_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0))
-
         return {"val_psnr": psnr, "val_ssim": ssim}
 
     def test_step(self, batch, batch_idx):
@@ -341,10 +354,8 @@ class ResKANLightning(pl.LightningModule):
 
         psnr = self.val_psnr(pred, gt)
         ssim = self.val_ssim(pred, gt)
-        
         self.log("test_psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
         self.log("test_ssim", ssim, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
-
         return {"test_psnr": psnr, "test_ssim": ssim}
 
     def configure_optimizers(self):
