@@ -1,0 +1,15 @@
+_target_: src.our_kan.ResKAN
+mode: universal_unrolled
+in_ch: 3
+feat_ch: 48
+num_blocks: 8
+kan_K: 32
+T: 8
+tau: 1.0
+gamma: 0.0
+ksize_data: 7
+use_gate: True
+lr: 2e-4
+weight_decay: 0.0
+lambda_tv: 0.0
+lambda_sobolev: 1e-4

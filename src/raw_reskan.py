@@ -320,7 +320,7 @@ class ResKANLightning(pl.LightningModule):
         if self.lambda_sobolev > 0:
             loss = loss + self.lambda_sobolev * self._kan_sobolev_penalty()
 
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=lq.size(0))
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
