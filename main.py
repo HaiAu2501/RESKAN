@@ -1,3 +1,4 @@
+import os
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -26,6 +27,10 @@ def main(cfg: DictConfig):
     trainer, ckpt_callback = setup(cfg.trainer)
 
     model = instantiate(cfg.model)
+    if os.getenv("CHECKPOINT_PATH"):
+        ckpt_path = os.getenv("CHECKPOINT_PATH")
+        model = type(model).load_from_checkpoint(ckpt_path)
+        print(f"Fine-tuning from checkpoint: {ckpt_path}")
     train_loader = loader.train_dataloader()
     val_loader = loader.val_dataloader()
 
