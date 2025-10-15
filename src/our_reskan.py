@@ -1,6 +1,6 @@
-# reskan.py 
+# reskan.py
 import math
-from typing import Tuple, Optional
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,8 +30,9 @@ class CharbonnierLoss(nn.Module):
             return loss
 
 
-def tv_l1(x: torch.Tensor) -> torch.Tensor:
-    return (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
+def tv_l1(x):
+    loss = (x[:, :, :, :-1] - x[:, :, :, 1:]).abs().mean() + (x[:, :, :-1, :] - x[:, :, 1:, :]).abs().mean()
+    return loss
 
 
 # --------------------------------------
@@ -58,7 +59,7 @@ class HaarDWT2D(nn.Module):
         for p in self.conv.parameters():
             p.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, C, H, W = x.shape
         if H % 2 != 0 or W % 2 != 0:
             x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
@@ -86,37 +87,40 @@ class HaarIDWT2D(nn.Module):
         for p in self.deconv.parameters():
             p.requires_grad = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.deconv(x)
 
 
 # ---------------------------------------------------------
-#  KAN: cubic B-spline 1D (degree=3), separable & memory-safe
+#  Memory-efficient local B-spline evaluation (p+1 only)
 # ---------------------------------------------------------
 class KANCubic1D(nn.Module):
     """
-    phi_c(x) = id_gain_c * x + bias_c + sum_{j in {i-1,i,i+1,i+2}} alpha[c, j] * B_j(t),
-    i = floor(u), t = u - i, u = map([-1,1]->[0,K-1]).
-    Khởi tạo "hiền": id_gain=0, alpha=0, bias=0 => KAN ~ 0 lúc đầu.
+    KAN 1D cubic cardinal B-spline (degree=3), memory-safe & no in-place.
+    phi_c(x) = id_gain_c * x + bias_c + sum_{j=0..3} alpha_{c, i+j-1} * B_j(t),
+    với i = floor(u), t = u - i, u map từ [-1,1] -> [0, K-1].
     """
-    def __init__(self, channels: int, K: int = 32, clamp_val: Optional[float] = 6.0):
+    def __init__(self, channels: int, K: int = 32, clamp_val: float = 1.5):
         super().__init__()
         assert K >= 4, "Cubic cần K >= 4"
         self.C = channels
         self.K = K
         self.clamp_val = clamp_val
-
-        self.a = nn.Parameter(torch.ones(channels))       # giữ 1.0 để không bóp méo lớn
+        # map per-channel: a*x + b để phủ [-1,1]
+        self.a = nn.Parameter(torch.ones(channels))
         self.b = nn.Parameter(torch.zeros(channels))
+        # spline weights
         self.alpha = nn.Parameter(torch.zeros(channels, K))
-        self.id_gain = nn.Parameter(torch.zeros(channels))  # <<< KHỞI TẠO 0.0
+        # skip linear + bias
+        self.id_gain = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
-
+        # biên miền [-1,1]
         self.register_buffer("low", torch.tensor(-1.0), persistent=False)
         self.register_buffer("high", torch.tensor(1.0), persistent=False)
 
     @staticmethod
-    def _cubic_basis(t: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    def _cubic_basis(t: torch.Tensor):
+        # t in [0,1], trả về (b0,b1,b2,b3) broadcast với shape t
         t2 = t * t
         t3 = t2 * t
         b0 = (1 - 3*t + 3*t2 - t3) / 6.0
@@ -125,51 +129,225 @@ class KANCubic1D(nn.Module):
         b3 = t3 / 6.0
         return b0, b1, b2, b3
 
-    def _gather_alpha_linear(self, idx: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = idx.shape
-        K = self.K
-        c = torch.arange(C, device=idx.device).view(1, C, 1, 1).expand(B, C, H, W)
-        lin = c * K + idx
-        return torch.take(self.alpha.view(-1), lin.view(-1)).view(B, C, H, W)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,C,H,W)
         B, C, H, W = x.shape
         assert C == self.C
+        # affine + clamp (không in-place)
         x_aff = x * self.a.view(1, C, 1, 1) + self.b.view(1, C, 1, 1)
         if self.clamp_val is not None:
             x_aff = torch.clamp(x_aff, -self.clamp_val, self.clamp_val)
 
+        # map [-1,1] -> [0, K-1]
         u = (x_aff - self.low) / (self.high - self.low) * (self.K - 1)
-        i = torch.floor(u).to(torch.long)
-        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)
+        i = torch.floor(u).to(torch.long)              # (B,C,H,W)
+        t = (u - i.to(u.dtype)).clamp(0.0, 1.0)        # [0,1]
 
+        # 4 chỉ số lân cận, clamp biên (KHÔNG in-place)
         i0 = (i - 1).clamp(0, self.K - 1)
         i1 = i.clamp(0, self.K - 1)
         i2 = (i + 1).clamp(0, self.K - 1)
         i3 = (i + 2).clamp(0, self.K - 1)
 
-        b0, b1, b2, b3 = self._cubic_basis(t)
+        # 4 weights cubic theo t
+        b0, b1, b2, b3 = self._cubic_basis(t)          # (B,C,H,W) each
 
-        a0 = self._gather_alpha_linear(i0)
-        a1 = self._gather_alpha_linear(i1)
-        a2 = self._gather_alpha_linear(i2)
-        a3 = self._gather_alpha_linear(i3)
+        # gather alpha theo 4 chỉ số (dùng take_along_dim/gather — không in-place)
+        alpha = self.alpha.view(1, C, 1, 1, self.K).expand(B, C, H, W, self.K)  # view an toàn (chỉ đọc)
+        a0 = torch.gather(alpha, -1, i0.unsqueeze(-1)).squeeze(-1)
+        a1 = torch.gather(alpha, -1, i1.unsqueeze(-1)).squeeze(-1)
+        a2 = torch.gather(alpha, -1, i2.unsqueeze(-1)).squeeze(-1)
+        a3 = torch.gather(alpha, -1, i3.unsqueeze(-1)).squeeze(-1)
 
-        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3
+        spline_val = a0*b0 + a1*b1 + a2*b2 + a3*b3      # (B,C,H,W)
         y = self.id_gain.view(1, C, 1, 1) * x + spline_val + self.bias.view(1, C, 1, 1)
         return y
 
-    def sobolev_penalty(self) -> torch.Tensor:
+    def sobolev_penalty(self):
         d1 = self.alpha[:, 1:] - self.alpha[:, :-1]
         d2 = d1[:, 1:] - d1[:, :-1]
         return (d2 ** 2).mean()
 
 
+# ----------------------------
+#  Norm & small helper layers
+# ----------------------------
+class LayerNorm2d(nn.Module):
+    """Channel-wise LayerNorm for 2D feature maps."""
+    def __init__(self, num_channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x):
+        # x: (B,C,H,W)
+        mean = x.mean(dim=(2, 3), keepdim=True)
+        var = x.var(dim=(2, 3), keepdim=True, unbiased=False)
+        x_hat = (x - mean) / torch.sqrt(var + self.eps)
+        return x_hat * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+
+
+# -------------------------------------------
+#  Multi-Axis Gating (MAXIM-inspired, light)
+# -------------------------------------------
+class MultiAxisGating(nn.Module):
+    """
+    Tuyến tính theo số điểm ảnh. Nhánh trục-H (kx1 depthwise), trục-W (1xk depthwise),
+    và nhánh global-grid (AdaptiveAvgPool -> 1x1 -> upsample). Trộn bằng pointwise conv.
+    """
+    def __init__(self, channels: int, expand: float = 2.0, kernel_size: int = 7, grid_size: int = 8):
+        super().__init__()
+        self.norm = LayerNorm2d(channels)
+        hidden = max(int(channels * expand), 8)
+        pad = kernel_size // 2
+
+        self.pw_in = nn.Conv2d(channels, hidden, kernel_size=1, bias=True)
+
+        # axial depthwise conv
+        self.dw_h = nn.Conv2d(hidden, hidden, kernel_size=(kernel_size, 1), padding=(pad, 0),
+                              groups=hidden, bias=True)
+        self.dw_w = nn.Conv2d(hidden, hidden, kernel_size=(1, kernel_size), padding=(0, pad),
+                              groups=hidden, bias=True)
+
+        # global grid pooling branch
+        self.grid_size = grid_size
+        self.pw_grid = nn.Conv2d(hidden, hidden, kernel_size=1, bias=True)
+
+        # fuse
+        self.pw_out = nn.Conv2d(hidden * 3, channels, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        # x: (B,C,H,W)
+        B, C, H, W = x.shape
+        y = self.norm(x)
+        y = self.pw_in(y)
+        y_h = F.gelu(self.dw_h(y))
+        y_w = F.gelu(self.dw_w(y))
+
+        # global-grid pooling
+        g = F.adaptive_avg_pool2d(y, output_size=self.grid_size)
+        g = F.gelu(self.pw_grid(g))
+        g = F.interpolate(g, size=(H, W), mode="bilinear", align_corners=False)
+
+        fused = torch.cat([y_h, y_w, g], dim=1)
+        out = self.pw_out(fused)  # (B,C,H,W)
+        return out
+
+
+class CrossGating(nn.Module):
+    """
+    Cross-gating nhánh chéo: gate(X) = sigma(MAG(Y)), gate(Y) = sigma(MAG(X))
+    """
+    def __init__(self, channels: int, expand: float = 2.0, kernel_size: int = 7, grid_size: int = 8):
+        super().__init__()
+        self.gx = MultiAxisGating(channels, expand, kernel_size, grid_size)
+        self.gy = MultiAxisGating(channels, expand, kernel_size, grid_size)
+
+    def forward(self, x, y):
+        # x,y: (B,C,H,W)
+        gate_y = torch.sigmoid(self.gx(y))
+        gate_x = torch.sigmoid(self.gy(x))
+        x_hat = x * gate_y
+        y_hat = y * gate_x
+        return x_hat, y_hat
+
+
+# ------------------------------------------------------
+#  Cross-Subband Low-Rank Coupler (within 4-band groups)
+# ------------------------------------------------------
+class CrossSubbandLowRankCoupler(nn.Module):
+    """
+    Trộn 4 dải LL/LH/HL/HH theo từng kênh gốc bằng biến đổi (I + U V^T), hạng thấp r.
+    In:  (B, 4F, H, W)
+    Out: (B, 4F, H, W)
+    """
+    def __init__(self, feat_ch: int, rank: int = 1):
+        super().__init__()
+        self.groups = feat_ch   # mỗi group tương ứng 4 subbands
+        self.rank = rank
+        # U, V: (G, 4, r). Khởi tạo nhỏ để gần identity.
+        self.U = nn.Parameter(torch.zeros(self.groups, 4, rank))
+        self.V = nn.Parameter(torch.zeros(self.groups, 4, rank))
+
+    def forward(self, z):
+        # z: (B, 4F, H, W)
+        B, C, H, W = z.shape
+        G = self.groups
+        assert C == 4 * G, f"Expected channels = 4*feat_ch. Got {C} vs 4*{G}"
+
+        z_rg = z.view(B, G, 4, H, W)  # (B,G,4,H,W)
+        # W_g = I + U_g V_g^T, tính bằng einsum
+        # UVT: (G,4,4)
+        UVT = torch.einsum('gik,gjk->gij', self.U, self.V)
+        I = torch.eye(4, device=z.device, dtype=z.dtype).unsqueeze(0).expand(G, 4, 4)
+        Wg = I + UVT  # (G,4,4)
+
+        # apply: out[b,g,i,h,w] = sum_j Wg[g,i,j] * z_rg[b,g,j,h,w]
+        out = torch.einsum('gij,bgjhw->bgihw', Wg, z_rg)  # (B,G,4,H,W)
+        out = out.reshape(B, 4 * G, H, W)
+        return out
+
+
+# -----------------------------------
+#  MoE-KAN: mixture of KANCubic1D
+# -----------------------------------
+class MoEKAN1D(nn.Module):
+    """
+    M chuyên gia KAN theo kênh. Định tuyến mềm bằng GAP -> 1x1 -> softmax.
+    Gọn VRAM: trọng số gate theo (B,M,1,1), không theo (B,M,C,H,W).
+    """
+    def __init__(self, channels: int, K: int = 32, num_experts: int = 3, gate_hidden: int | None = None):
+        super().__init__()
+        self.M = num_experts
+        self.experts = nn.ModuleList([KANCubic1D(channels, K=K) for _ in range(num_experts)])
+        gh = gate_hidden if gate_hidden is not None else max(channels // 4, 16)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, gh, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(gh, num_experts, kernel_size=1)
+        )
+
+    def forward(self, z):
+        # z: (B,C,H,W)
+        B, C, H, W = z.shape
+        logits = self.gate(z)                 # (B,M,1,1)
+        weights = torch.softmax(logits, dim=1)  # (B,M,1,1)
+
+        outs = [exp(z) for exp in self.experts]             # list of (B,C,H,W)
+        stack = torch.stack(outs, dim=1)                    # (B,M,C,H,W)
+        y = (weights.unsqueeze(2) * stack).sum(dim=1)       # (B,C,H,W)
+        return y
+
+    def sobolev_penalty(self):
+        pen = 0.0
+        for exp in self.experts:
+            pen = pen + exp.sobolev_penalty()
+        return pen / self.M
+
+
 # -------------------------
-#  ResKAN Residual Block (sửa rất nhỏ)
+#  ResKAN+ Residual Block
 # -------------------------
 class ResKANBlock(nn.Module):
-    def __init__(self, feat_ch: int, kernel_size: int = 3, kan_K: int = 16, kan_degree: int = 3):
+    """
+    ResKAN+ block:
+      DWT -> Conv(3x3) -> Norm -> CSLC(4-band low-rank) ->
+      Split 1/2 ch -> CrossGating (multi-axis) -> Concat ->
+      MoE-KAN -> Conv(3x3) -> SE -> iDWT -> Residual add
+    """
+    def __init__(
+        self,
+        feat_ch: int,
+        kernel_size: int = 3,
+        kan_K: int = 32,
+        moe_experts: int = 3,
+        gate_expand: float = 2.0,
+        gate_kernel: int = 7,
+        gate_grid: int = 8,
+        cslc_rank: int = 1
+    ):
         super().__init__()
         self.dwt = HaarDWT2D(feat_ch)
         self.idwt = HaarIDWT2D(feat_ch)
@@ -177,87 +355,89 @@ class ResKANBlock(nn.Module):
         in_ch = 4 * feat_ch
         padding = kernel_size // 2
 
-        # GIỮ groups=1 như bản gốc (không đổi kiến trúc)
         self.conv1 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
-        self.kan = KANCubic1D(in_ch, K=kan_K)  # dùng đúng kan_K người dùng truyền vào
+        self.norm1 = LayerNorm2d(in_ch)
+
+        # Low-rank subband coupler
+        self.cslc = CrossSubbandLowRankCoupler(feat_ch, rank=cslc_rank)
+
+        # Cross-gating operates on half channels each
+        assert in_ch % 2 == 0, "in_ch must be even to split"
+        self.cross_gate = CrossGating(in_ch // 2, expand=gate_expand, kernel_size=gate_kernel, grid_size=gate_grid)
+
+        # MoE-KAN on full channels after concat
+        self.moe_kan = MoEKAN1D(in_ch, K=kan_K, num_experts=moe_experts)
+
         self.conv2 = nn.Conv2d(in_ch, in_ch, kernel_size, padding=padding, groups=1, bias=True)
 
-        # SE giữ nguyên, nhưng bias cuối khởi tạo dương để gate≈1 lúc đầu
-        self.se_conv1 = nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1)
-        self.se_conv2 = nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1)
+        # Squeeze-Excite (task-agnostic channel reweight)
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            self.se_conv1,
-            nn.ReLU(),  # không inplace
-            self.se_conv2,
+            nn.Conv2d(in_ch, max(in_ch // 8, 8), kernel_size=1),
+            nn.ReLU(),  # not inplace
+            nn.Conv2d(max(in_ch // 8, 8), in_ch, kernel_size=1),
             nn.Sigmoid()
         )
 
-        # Residual scaling để gần-identity nhưng có gradient
-        self.res_scale = nn.Parameter(torch.tensor(0.1))  # học được; init nhỏ
-
-        # Init cẩn thận để nhánh residual nhỏ nhưng không tắc gradient
-        self._init_weights()
-
-    def _init_weights(self):
-        # conv1, conv2: Kaiming, nhưng scale nhỏ cho conv2
-        nn.init.kaiming_normal_(self.conv1.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-        if self.conv1.bias is not None:
-            nn.init.zeros_(self.conv1.bias)
-
-        nn.init.kaiming_normal_(self.conv2.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-        with torch.no_grad():
-            self.conv2.weight.mul_(0.1)  # scale nhỏ để không phá identity ở init
-        if self.conv2.bias is not None:
-            nn.init.zeros_(self.conv2.bias)
-
-        # SE gate ≈ 1 ở init (đừng bóp méo nhánh)
-        nn.init.kaiming_normal_(self.se_conv1.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-        nn.init.zeros_(self.se_conv1.bias)
-        nn.init.zeros_(self.se_conv2.weight)
-        nn.init.constant_(self.se_conv2.bias, 2.0)  # sigmoid(2)~0.88
-
-        # KAN đã init "hiền": id_gain=0, alpha=0, bias=0 (ở lớp KAN)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.dwt(x)            # (B, 4F, H/2, W/2)
+    def forward(self, x):
+        # x: (B,F,H,W)
+        z = self.dwt(x)                        # (B, 4F, H/2, W/2)
         z = self.conv1(z)
-        z = self.kan(z)
+        z = F.gelu(self.norm1(z))
+
+        # low-rank subband coupling per 4-group
+        z = self.cslc(z)                       # (B, 4F, H/2, W/2)
+
+        # cross-gating between two channel halves
+        z1, z2 = torch.chunk(z, chunks=2, dim=1)  # each (B, 2F, H/2, W/2)
+        z1g, z2g = self.cross_gate(z1, z2)
+        z = torch.cat([z1g, z2g], dim=1)       # (B, 4F, H/2, W/2)
+
+        # MoE-KAN nonlinearity (per-channel)
+        z = self.moe_kan(z)
         z = self.conv2(z)
+
+        # SE channel gating
         z = z * self.se(z)
-        y = self.idwt(z)
-        return x + self.res_scale * y
+
+        y = self.idwt(z)                       # (B, F, H, W)
+        return x + y
 
 
 # -------------------------
-#  Full ResKAN Network
+#  Full ResKAN+ Network
 # -------------------------
 class ResKANNet(nn.Module):
-    def __init__(self, in_ch: int = 3, feat_ch: int = 64, num_blocks: int = 8,
-                 kan_K: int = 16, kan_degree: int = 3):
+    def __init__(
+        self,
+        in_ch: int = 3,
+        feat_ch: int = 64,
+        num_blocks: int = 8,
+        kan_K: int = 32,
+        moe_experts: int = 3,
+        gate_expand: float = 2.0,
+        gate_kernel: int = 7,
+        gate_grid: int = 8,
+        cslc_rank: int = 1
+    ):
         super().__init__()
         self.shallow = nn.Conv2d(in_ch, feat_ch, kernel_size=3, padding=1)
         self.blocks = nn.ModuleList([
-            ResKANBlock(feat_ch, kernel_size=3, kan_K=kan_K, kan_degree=kan_degree)
+            ResKANBlock(
+                feat_ch=feat_ch,
+                kernel_size=3,
+                kan_K=kan_K,
+                moe_experts=moe_experts,
+                gate_expand=gate_expand,
+                gate_kernel=gate_kernel,
+                gate_grid=gate_grid,
+                cslc_rank=cslc_rank,
+            )
             for _ in range(num_blocks)
         ])
         self.recon = nn.Conv2d(feat_ch, in_ch, kernel_size=3, padding=1)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        # Shallow & recon: nhỏ để gần-identity nhưng vẫn cho gradient
-        nn.init.kaiming_normal_(self.shallow.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-        if self.shallow.bias is not None:
-            nn.init.zeros_(self.shallow.bias)
-
-        nn.init.kaiming_normal_(self.recon.weight, a=0.2, mode="fan_in", nonlinearity="leaky_relu")
-        with torch.no_grad():
-            self.recon.weight.mul_(1e-2)  # rất nhỏ để out≈0 lúc đầu
-        if self.recon.bias is not None:
-            nn.init.zeros_(self.recon.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         inp = x
         f = self.shallow(x)
         for blk in self.blocks:
@@ -275,8 +455,12 @@ class ResKANLightning(pl.LightningModule):
         in_ch: int = 3,
         feat_ch: int = 64,
         num_blocks: int = 8,
-        kan_K: int = 16,
-        kan_degree: int = 3,
+        kan_K: int = 32,
+        moe_experts: int = 3,
+        gate_expand: float = 2.0,
+        gate_kernel: int = 7,
+        gate_grid: int = 8,
+        cslc_rank: int = 1,
         lr: float = 2e-4,
         wd: float = 1e-8,
         lambda_charb: float = 1.0,
@@ -289,7 +473,9 @@ class ResKANLightning(pl.LightningModule):
 
         self.net = ResKANNet(
             in_ch=in_ch, feat_ch=feat_ch, num_blocks=num_blocks,
-            kan_K=kan_K, kan_degree=kan_degree
+            kan_K=kan_K, moe_experts=moe_experts,
+            gate_expand=gate_expand, gate_kernel=gate_kernel,
+            gate_grid=gate_grid, cslc_rank=cslc_rank
         )
 
         self.loss_charb = CharbonnierLoss(eps=1e-3)
@@ -305,13 +491,16 @@ class ResKANLightning(pl.LightningModule):
         self.lambda_tv = lambda_tv
         self.lambda_sobolev = lambda_sobolev
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.net(x)
 
-    def _kan_sobolev_penalty(self) -> torch.Tensor:
+    def _kan_sobolev_penalty(self):
         pen = 0.0
         for m in self.net.modules():
+            # tính cả KAN đơn lẻ và KAN trong MoE
             if isinstance(m, KANCubic1D):
+                pen = pen + m.sobolev_penalty()
+            if isinstance(m, MoEKAN1D):
                 pen = pen + m.sobolev_penalty()
         return pen
 
@@ -323,7 +512,7 @@ class ResKANLightning(pl.LightningModule):
         if self.lambda_charb > 0:
             loss = loss + self.lambda_charb * self.loss_charb(pred, gt)
         if self.lambda_l1 > 0:
-            loss = loss + self.lambda_l1 * nn.functional.l1_loss(pred, gt)
+            loss = loss + self.lambda_l1 * self.loss_l1(pred, gt)
         if self.lambda_tv > 0:
             loss = loss + self.lambda_tv * tv_l1(pred)
         if self.lambda_sobolev > 0:
@@ -345,6 +534,7 @@ class ResKANLightning(pl.LightningModule):
 
         val_loss = self.loss_charb(pred, gt)
         self.log("val_loss", val_loss, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0))
+
         return {"val_psnr": psnr, "val_ssim": ssim}
 
     def test_step(self, batch, batch_idx):
@@ -354,8 +544,10 @@ class ResKANLightning(pl.LightningModule):
 
         psnr = self.val_psnr(pred, gt)
         ssim = self.val_ssim(pred, gt)
+
         self.log("test_psnr", psnr, prog_bar=True, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
         self.log("test_ssim", ssim, prog_bar=False, on_step=False, on_epoch=True, batch_size=lq.size(0), sync_dist=False)
+
         return {"test_psnr": psnr, "test_ssim": ssim}
 
     def configure_optimizers(self):
